@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Fake claude CLI for subagent-mcp tests.
+
+Logs argv and the positional prompt to $SUBAGENT_TEST_LOG, then sleeps so tests
+have time to inspect the tmux pane.
+"""
+
+import json
+import os
+import sys
+import time
+
+
+def main() -> None:
+    log_path = os.environ.get("SUBAGENT_TEST_LOG")
+    # Find the prompt: the first non-option argument.
+    # Supports --model x, --agent y, --dangerously-skip-permissions.
+    prompt: str | None = None
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in ("--model", "--agent"):
+            i += 2
+            continue
+        if arg == "--dangerously-skip-permissions":
+            i += 1
+            continue
+        prompt = arg
+        # Keep scanning in case more trailing args; use the last one.
+        i += 1
+
+    out = {"cli": "claude", "argv": sys.argv[1:], "prompt": prompt}
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(out, ensure_ascii=False) + "\n")
+    else:
+        print(json.dumps(out, ensure_ascii=False))
+
+    # Sleep until killed or a very long timeout.
+    time.sleep(120)
+
+
+if __name__ == "__main__":
+    main()
