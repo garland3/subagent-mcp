@@ -66,6 +66,13 @@ class ServerConfig:
     claude_projects_root: Path | None = None
     opencode_state_root: Path | None = None
 
+    # Phase 1.2: install a Claude Code Stop hook that touches a sentinel in
+    # the run dir when the agent finishes a turn. The hook is written to
+    # ``<cwd>/.claude/settings.local.json`` (project-local, not checked in)
+    # and merged with any existing hooks so a user's config is never
+    # clobbered. Disabled here for tests that don't want the side effect.
+    install_stop_hooks: bool = True
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", self.root.resolve())
         object.__setattr__(self, "runs_root", self.runs_root.resolve())

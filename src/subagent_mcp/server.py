@@ -14,7 +14,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from .cli_paths import resolve_cli, searched_dirs
+from .cli_paths import augmented_path, resolve_cli, searched_dirs
 from .config import ServerConfig, cwd_is_allowed, get_config
 from .runners import RunnerError, build_runner
 from .runs import (
@@ -43,7 +43,7 @@ _DEFAULT_INSTRUCTIONS = (
     "Launch coding-CLI subagents (claude, opencode) in tmux windows — detached by "
     "default, or visible with watch='switch'/'terminal'. Tools: launch_subagent, "
     "check_subagent, watch_subagent, list_subagents, send_to_subagent, "
-    "stop_subagent, sweep_stale_subagents."
+    "resume_subagent, stop_subagent, sweep_stale_subagents."
 )
 
 # Output snippets that indicate the subagent CLI is blocked waiting for human
@@ -79,6 +79,8 @@ mcp = FastMCP("subagent-mcp", instructions=_DEFAULT_INSTRUCTIONS)
 def _tip(name: str) -> dict[str, Any]:
     """Build annotations hint for an MCP tool."""
     if name == "launch_subagent":
+        return {"readOnlyHint": False, "openWorldHint": True}
+    if name == "resume_subagent":
         return {"readOnlyHint": False, "openWorldHint": True}
     if name == "watch_subagent":
         # Not destructive, but it moves the user's terminal view / opens a window.
@@ -171,6 +173,52 @@ def _run_prompt_text(run: Run) -> str:
         return ""
 
 
+# Phase 1.5: cap for RESULT.md content returned in check_subagent. Keeps the
+# payload small while showing the operator enough to decide whether to act.
+_RESULT_MD_MAX_CHARS = 4000
+_RESULT_MD_MAX_LINES = 80
+
+
+def _result_payload(run: Run) -> dict[str, Any]:
+    """Read RESULT.md and STATUS.json for an idle run.
+
+    Returns a dict with:
+    - ``result``: "present" or "none" (never silent success — §1.1/§5.2)
+    - ``result_md``: content of RESULT.md, capped to keep the payload small
+    - ``status``: parsed STATUS.json (exit code, git SHAs, changed files) or None
+
+    Absence of RESULT.md is ``result="none"`` — the design (§3.4 risk 8) calls
+    this out: "Make absence a visible state."
+    """
+    result_path = run.run_dir / "RESULT.md"
+    result_md = ""
+    result_status = "none"
+    if result_path.is_file():
+        try:
+            result_md = result_path.read_text(encoding="utf-8")
+            result_status = "present"
+        except OSError:
+            pass
+
+    # Cap to keep the payload small (Phase 0 already strips box-drawing from
+    # the tail; the result is a different artifact and gets its own cap).
+    if len(result_md) > _RESULT_MD_MAX_CHARS:
+        result_md = result_md[:_RESULT_MD_MAX_CHARS] + "\n…[truncated]"
+    result_lines = result_md.splitlines()
+    if len(result_lines) > _RESULT_MD_MAX_LINES:
+        result_md = "\n".join(result_lines[-_RESULT_MD_MAX_LINES:]) + "\n…[truncated]"
+
+    status_path = run.run_dir / "STATUS.json"
+    status: dict[str, Any] | None = None
+    if status_path.is_file():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            status = None
+
+    return {"result": result_status, "result_md": result_md, "status": status}
+
+
 def _live_panes(tm: Tmux) -> set[tuple[str, int]]:
     """Snapshot of live panes as (pane_id, pane_pid) tuples."""
     live: set[tuple[str, int]] = set()
@@ -205,12 +253,199 @@ def _state_for(run: Run, cfg: ServerConfig) -> tuple[str, str]:
     Reads the CLI's own persisted transcript, not the tmux TUI, so this works
     whether or not the pane is alive. See runs.derive_state for the per-CLI
     paths and the quiescence/idle heuristics.
+
+    If the Stop-hook sentinel exists (Phase 1.2), it takes precedence — it is
+    the parsing-free completion signal that the transcript-parsing fallback
+    exists to cover (§3.4 ladder: rung 2 over rung 1).
     """
+    override, sentinel_activity = _check_stop_sentinel(run)
+    if override:
+        return override, sentinel_activity
     return derive_state(
         run,
         claude_projects_root=cfg.claude_projects_root,
         opencode_state_root=cfg.opencode_state_root,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.2 — Stop-hook confirmation (§3.4 #2).
+#
+# Claude Code supports hooks in settings.json. We install a Stop hook into
+# ``<cwd>/.claude/settings.local.json`` (project-local, not checked in) so a
+# user's existing hook config is never clobbered. The hook touches a sentinel
+# file in the run dir when the agent finishes a turn — the parsing-free
+# completion signal. The transcript-parsing fallback (Phase 0.2) covers the
+# case where the hook is absent (e.g. opencode, or a claude version without
+# hook support).
+# ---------------------------------------------------------------------------
+
+_STOP_SENTINEL_NAME = ".stop-sentinel"
+
+
+def _stop_sentinel_path(run: Run) -> Path:
+    return run.run_dir / _STOP_SENTINEL_NAME
+
+
+def _check_stop_sentinel(run: Run) -> tuple[str | None, str]:
+    """Return (state_override, last_activity_iso) from the Stop-hook sentinel.
+
+    state_override is ``"idle"`` if the sentinel was touched (the agent
+    finished a turn), or ``None`` to fall back to transcript parsing.
+    """
+    sentinel = _stop_sentinel_path(run)
+    if not sentinel.is_file():
+        return None, ""
+    try:
+        mtime = sentinel.stat().st_mtime
+    except OSError:
+        return None, ""
+    return "idle", datetime.fromtimestamp(mtime, timezone.utc).isoformat()
+
+
+def _stop_hook_script_path(run: Run) -> Path:
+    return run.run_dir / "stop-hook.sh"
+
+
+def _write_stop_hook_script(run: Run) -> Path:
+    """Write the per-run Stop hook script that touches the sentinel.
+
+    The script reads the JSON event on stdin, extracts ``session_id``, and
+    touches the sentinel only if it matches this run's session_id. If the
+    session_id can't be extracted (e.g. claude doesn't provide it), it touches
+    unconditionally — the hook is already scoped to the cwd, so a Stop event
+    in this directory is relevant.
+    """
+    script = _stop_hook_script_path(run)
+    sentinel = _stop_sentinel_path(run)
+    sid = run.session_id or ""
+    text = (
+        "#!/usr/bin/env bash\n"
+        f"# subagent-mcp Stop hook for run {run.run_id}\n"
+        "# Fires when a claude session in this cwd finishes a turn.\n"
+        f"# Touches the sentinel only if the session_id matches this run.\n"
+        'input=$(cat)\n'
+        'sid=$(echo "$input" | python3 -c "\n'
+        "import sys, json\n"
+        "try:\n"
+        "    print(json.load(sys.stdin).get('session_id', ''))\n"
+        "except Exception:\n"
+        "    print('')\n"
+        '" 2>/dev/null || echo "")\n'
+        f'if [ -z "$sid" ] || [ "$sid" = {shlex.quote(sid)} ]; then\n'
+        f"  touch {shlex.quote(str(sentinel))}\n"
+        "fi\n"
+    )
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def _install_stop_hook(run: Run, cwd: Path, cfg: ServerConfig) -> str | None:
+    """Install/ensure a Claude Code Stop hook for this run in the cwd.
+
+    Writes the hook config to ``<cwd>/.claude/settings.local.json`` (project-
+    local, not checked in), merging with any existing hooks so a user's
+    config is never clobbered. Returns the path to the settings file, or
+    None if the hook was not installed (e.g. disabled or no session_id).
+    """
+    if not cfg.install_stop_hooks:
+        return None
+    # Only claude has a Stop-hook mechanism today; opencode relies on the
+    # transcript-parsing fallback (Phase 0.2).
+    if run.cli != "claude":
+        return None
+    if not run.session_id:
+        return None
+
+    _write_stop_hook_script(run)
+    script_path = _stop_hook_script_path(run)
+
+    settings_dir = cwd / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = settings_dir / "settings.local.json"
+
+    # Read existing settings (or start fresh), preserving any user config.
+    existing: dict[str, Any] = {}
+    if settings_path.is_file():
+        try:
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    hooks = existing.setdefault("hooks", {})
+    stop_hooks = hooks.setdefault("Stop", [])
+
+    # Check if this run's hook is already registered (idempotent install).
+    hook_command = str(script_path)
+    for entry in stop_hooks:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks", []):
+            if isinstance(hook, dict) and hook.get("command") == hook_command:
+                return str(settings_path)  # already installed
+
+    stop_hooks.append(
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": hook_command}],
+        }
+    )
+
+    settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    return str(settings_path)
+
+
+def _remove_stop_hook(run: Run, cwd: Path) -> None:
+    """Best-effort removal of this run's Stop hook entry from settings.local.json.
+
+    Called when a run is stopped or swept so the settings file does not grow
+    forever. Never raises — a stale entry is harmless (the script is gone).
+    """
+    settings_path = cwd / ".claude" / "settings.local.json"
+    if not settings_path.is_file():
+        return
+
+    script_path = _stop_hook_script_path(run)
+    hook_command = str(script_path)
+
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+
+    stop_hooks = data.get("hooks", {}).get("Stop", [])
+    if not stop_hooks:
+        return
+
+    hook_command = str(script_path)
+    changed = False
+    for entry in stop_hooks:
+        if not isinstance(entry, dict):
+            continue
+        entry_hooks = entry.get("hooks", [])
+        before = len(entry_hooks)
+        entry["hooks"] = [
+            h for h in entry_hooks
+            if not (isinstance(h, dict) and h.get("command") == hook_command)
+        ]
+        if len(entry["hooks"]) != before:
+            changed = True
+
+    # Drop empty entries.
+    data["hooks"]["Stop"] = [e for e in stop_hooks if e.get("hooks")]
+    if not data["hooks"]["Stop"]:
+        del data["hooks"]["Stop"]
+    if not data["hooks"]:
+        del data["hooks"]
+
+    if changed:
+        try:
+            settings_path.write_text(
+                json.dumps(data, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
 
 # A failed opencode capture must be visible in the run record, not silent —
@@ -664,6 +899,12 @@ def launch_subagent(
     pane_pid = tm.pane_pid(pane_id)
     update_run_pane(run, pane_id, pane_pid=pane_pid)
 
+    # Phase 1.2: install the Stop hook for claude runs so a sentinel is
+    # touched when the agent finishes a turn. This is the parsing-free
+    # completion signal; the transcript-parsing fallback covers opencode
+    # and any claude version without hook support.
+    stop_hook_path = _install_stop_hook(run, cwd_path, cfg)
+
     # Start logging before the settle wait so nothing printed during startup is
     # lost, then put the run on screen if the caller asked to see it.
     output_log = _start_output_log(tm, run) if cfg.pipe_logs else ""
@@ -725,6 +966,10 @@ def launch_subagent(
             "session_id_status": run.session_id_status,
             "alive": alive,
             "current_command": current_command or "",
+            # Phase 1.2: the Stop hook settings file (or "" if not installed).
+            "stop_hook": stop_hook_path or "",
+            # Phase 1.1: where the agent should write its summary.
+            "result_file": str(run.run_dir / "RESULT.md"),
             # Box-drawing stripped and capped to keep the result focused on
             # the alive/blocked signal rather than TUI borders.
             "initial_output": _tail(raw_output, 20),
@@ -746,6 +991,13 @@ def check_subagent(
 ) -> str:
     """Capture the last output from a subagent and report state, liveness, and whether it is blocked on an interactive prompt.
 
+    When the subagent is idle (finished a turn), returns RESULT.md — the
+    agent's own summary of what it did, verified, could not do, and open
+    questions — plus STATUS.json (exit code, git SHAs, changed files) if the
+    wrapper has written it. Absence of RESULT.md is reported as
+    result="none", never silent success. While working, returns the tail of
+    the pane output (box-drawing stripped, capped).
+
     Use this instead of `tmux capture-pane` so you get the transcript-derived
     state (working|idle, not just TUI chrome) and so the run is reconciled
     if the pane is gone (a closed pane returns a dead snapshot, not an error).
@@ -765,6 +1017,8 @@ def check_subagent(
     # it is available even when the pane is no longer alive.
     state, last_activity = _state_for(run, cfg)
 
+    is_idle = state == "idle"
+
     try:
         output = tm.capture_pane(run.pane_id, lines=lines)
         alive = _is_alive(run, _live_panes(tm))
@@ -772,6 +1026,7 @@ def check_subagent(
     except TmuxError:
         # The pane has closed (e.g., Ctrl-C killed the wrapper). Report it as
         # no longer alive instead of raising a useless error.
+        result_fields = _result_payload(run) if is_idle else {}
         return _json(
             {
                 "run_id": run.run_id,
@@ -788,6 +1043,7 @@ def check_subagent(
                 "last_activity": last_activity,
                 "blocked": False,
                 "blocked_reason": "",
+                **result_fields,
             }
         )
 
@@ -795,6 +1051,16 @@ def check_subagent(
     # modal can appear at any point. Re-run the detector on every check so a
     # waiting subagent is visible without a human reading the pane.
     blocked, blocked_reason = _detect_blocked_output(output, _run_prompt_text(run))
+
+    # When idle, return the result (RESULT.md + STATUS.json) and skip the tail
+    # to keep the payload small. When working, return the tail (box-drawing
+    # stripped and capped) as today.
+    if is_idle:
+        result_fields = _result_payload(run)
+        pane_output = ""
+    else:
+        result_fields = {}
+        pane_output = _tail(output, lines)
 
     return _json(
         {
@@ -807,11 +1073,12 @@ def check_subagent(
             "session_id_status": run.session_id_status,
             "alive": alive,
             "current_command": current_command or "",
-            "output": output,
+            "output": pane_output,
             "state": state,
             "last_activity": last_activity,
             "blocked": blocked,
             "blocked_reason": blocked_reason or "",
+            **result_fields,
         }
     )
 
@@ -983,6 +1250,7 @@ def stop_subagent(
     # No pane id means the run was a dry run or never attached — reconcile the
     # registry entry rather than trying to stop nothing.
     if not run.pane_id:
+        _remove_stop_hook(run, run.cwd)
         delete_run_dirs(cfg.runs_root, [run.run_id])
         return _dead_snapshot(reconciled=True)
 
@@ -991,6 +1259,7 @@ def stop_subagent(
         # The pane is already gone. The user asked us to stop it; success is
         # the right answer, and we drop the stale registry entry instead of
         # raising ToolError (the old 33%-failure mode).
+        _remove_stop_hook(run, run.cwd)
         delete_run_dirs(cfg.runs_root, [run.run_id])
         return _dead_snapshot(reconciled=True)
 
@@ -1004,9 +1273,16 @@ def stop_subagent(
         # Race: the pane died between the alive check and the signal. Re-check
         # and reconcile if it is now gone; otherwise re-raise the real error.
         if not _is_alive(run, _live_panes(tm)):
+            _remove_stop_hook(run, run.cwd)
             delete_run_dirs(cfg.runs_root, [run.run_id])
             return _dead_snapshot(reconciled=True)
         raise
+
+    # The pane was stopped — remove the Stop hook entry even though the run
+    # dir stays (for sweep_stale_subagents to reap later). The hook script in
+    # the run dir is harmless once the settings entry is gone; resume_subagent
+    # re-installs the hook if the run is resumed.
+    _remove_stop_hook(run, run.cwd)
 
     time.sleep(0.5)
     try:
@@ -1064,6 +1340,13 @@ def sweep_stale_subagents(
             }
         )
 
+    # Best-effort: remove Stop hook entries before deleting run dirs so the
+    # settings file does not accumulate stale references.
+    for rid in stale_ids:
+        stale_run = reg.get(rid)
+        if stale_run:
+            _remove_stop_hook(stale_run, stale_run.cwd)
+
     removed = delete_run_dirs(cfg.runs_root, stale_ids)
     removed_set = set(removed)
     not_found = [rid for rid in stale_ids if rid not in removed_set]
@@ -1076,6 +1359,196 @@ def sweep_stale_subagents(
             "not_found": not_found,
             "alive": alive_count,
             "remaining_total": len(reg) - len(removed),
+        }
+    )
+
+
+def resume_subagent(
+    handle: Annotated[str, Field(description="run_id, pane id, or sess:win target of the run to resume")],
+    message: Annotated[str, Field(description="Follow-up message to send to the resumed session")],
+    dangerous: Annotated[bool, Field(description="Skip permission prompts (--dangerously-skip-permissions / --auto), matching the original launch")] = True,
+    watch: Annotated[str | None, Field(description="'off' = detached (default); 'switch' = pull an attached tmux client; 'terminal' = open a terminal")] = None,
+    settle_seconds: Annotated[float, Field(description="Seconds to wait before capturing initial output")] = 3.0,
+) -> str:
+    """Resume a finished subagent's session with a follow-up message, using the recorded CLI session id.
+
+    This reconstitutes the full conversation context from the CLI's persisted
+    session on disk — it does NOT depend on the original pane being alive
+    (§3.2). The whole point: ``claude --resume <session_id> "<message>"`` or
+    ``opencode run -s <session_id> "<message>"`` works whether the pane is
+    open or closed, because the conversation lives in a file, not a TTY.
+
+    If the original pane is still alive it is killed first (the session is
+    retained on disk, so nothing is lost). A new pane is opened for the
+    resume command. Use this instead of `tmux send-keys` when the pane is
+    gone, or when you want a clean follow-up that doesn't depend on a live
+    TTY. For a quick paste into a still-running pane, send_to_subagent is
+    lighter weight.
+
+    Fails with a clear message if session_id_status is "capture_failed" —
+    that run is NOT resumable through us (the session id was never obtained).
+    The handle is the run_id or the full session:window (e.g. atlas:fixit) —
+    never a bare window name, which can resolve to the wrong session.
+    """
+    cfg = _cfg()
+    tm = _tmux(cfg)
+    run = _resolve_handle(handle, cfg)
+
+    # The session id is the whole point — without it, resume is impossible.
+    if not run.session_id or run.session_id_status == "capture_failed":
+        raise ToolError(
+            f"Run {run.run_id!r} is not resumable: session_id is "
+            f"{'missing' if not run.session_id else 'capture_failed'}. "
+            "The CLI conversation id was never obtained, so the session "
+            "cannot be resumed through this tool. Use send_to_subagent if "
+            "the pane is still alive, or find the session manually."
+        )
+
+    # Resolve the CLI executable (may differ from the original launch if the
+    # PATH changed, but the absolute path approach from Phase 0 handles this).
+    executable = _resolve_executable(run.cli)
+
+    # Build the resume command. The message is quoted for the shell.
+    msg_quoted = shlex.quote(message)
+    if run.cli == "claude":
+        cmd_parts = [shlex.quote(executable)]
+        if dangerous:
+            cmd_parts.append("--dangerously-skip-permissions")
+        cmd_parts.extend(["--resume", shlex.quote(run.session_id), msg_quoted])
+    else:  # opencode
+        cmd_parts = [shlex.quote(executable), "run", "-s", shlex.quote(run.session_id)]
+        if dangerous:
+            cmd_parts.append("--auto")
+        cmd_parts.append(msg_quoted)
+    resume_command = " ".join(cmd_parts)
+
+    # Write a resume wrapper (reusing the same run dir). The wrapper mirrors
+    # run.sh: same PATH, same RESULT_FILE, same STATUS.json, same lifecycle.
+    result_path = run.run_dir / "RESULT.md"
+    status_path = run.run_dir / "STATUS.json"
+    resume_sh = run.run_dir / "resume.sh"
+    text = (
+        f"#!/usr/bin/env bash\n"
+        f"# generated by subagent-mcp resume — {run.run_id}\n"
+        f"export PATH={shlex.quote(augmented_path())}\n"
+        f"export SUBAGENT_RESULT_FILE={shlex.quote(str(result_path))}\n"
+        f"export SUBAGENT_RUN_ID={shlex.quote(run.run_id)}\n"
+        f"export SUBAGENT_STATUS_FILE={shlex.quote(str(status_path))}\n"
+        f"cd {shlex.quote(str(run.cwd))} || exit 1\n"
+        f"git_sha_before=$(git rev-parse HEAD 2>/dev/null || echo \"\")\n"
+        f"started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"{resume_command}\n"
+        f"code=$?\n"
+        f"ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"git_sha_after=$(git rev-parse HEAD 2>/dev/null || echo \"\")\n"
+        f"git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo \"\")\n"
+        f"if [ -n \"$git_sha_before\" ] && [ -n \"$git_sha_after\" ] \\\n"
+        f"   && [ \"$git_sha_before\" != \"$git_sha_after\" ]; then\n"
+        f"  changed_files=$(git diff --name-only \"$git_sha_before\" \"$git_sha_after\" 2>/dev/null)\n"
+        f"elif [ -n \"$git_sha_before\" ]; then\n"
+        f"  changed_files=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)\n"
+        f"else\n"
+        f"  changed_files=\"\"\n"
+        f"fi\n"
+        f"pr_url=$(gh pr view --json url -q .url 2>/dev/null || echo \"\")\n"
+        f"export SUBAGENT_EXIT_CODE=\"$code\"\n"
+        f"export SUBAGENT_STARTED_AT=\"$started_at\"\n"
+        f"export SUBAGENT_ENDED_AT=\"$ended_at\"\n"
+        f"export SUBAGENT_GIT_SHA_BEFORE=\"$git_sha_before\"\n"
+        f"export SUBAGENT_GIT_SHA_AFTER=\"$git_sha_after\"\n"
+        f"export SUBAGENT_GIT_BRANCH=\"$git_branch\"\n"
+        f"export SUBAGENT_CHANGED_FILES=\"$changed_files\"\n"
+        f"export SUBAGENT_PR_URL=\"$pr_url\"\n"
+        f"python3 -c \"\n"
+        f"import json, os\n"
+        f"status = {{\n"
+        f"  'run_id': os.environ.get('SUBAGENT_RUN_ID', ''),\n"
+        f"  'exit_code': int(os.environ.get('SUBAGENT_EXIT_CODE', '0') or '0'),\n"
+        f"  'started_at': os.environ.get('SUBAGENT_STARTED_AT', ''),\n"
+        f"  'ended_at': os.environ.get('SUBAGENT_ENDED_AT', ''),\n"
+        f"  'git_sha_before': os.environ.get('SUBAGENT_GIT_SHA_BEFORE', ''),\n"
+        f"  'git_sha_after': os.environ.get('SUBAGENT_GIT_SHA_AFTER', ''),\n"
+        f"  'git_branch': os.environ.get('SUBAGENT_GIT_BRANCH', ''),\n"
+        f"  'changed_files': [f for f in os.environ.get('SUBAGENT_CHANGED_FILES', '').splitlines() if f],\n"
+        f"  'pr_url': os.environ.get('SUBAGENT_PR_URL', ''),\n"
+        f"}}\n"
+        f"with open(os.environ.get('SUBAGENT_STATUS_FILE', '/dev/null'), 'w') as fh:\n"
+        f"  json.dump(status, fh, indent=2)\n"
+        f"\"\n"
+        f"printf '\\n[subagent-mcp] resumed %d — run dir: %s\\n' \"$code\" {shlex.quote(str(run.run_dir))}\n"
+        f'exec "${{SHELL:-/bin/bash}}" -i\n'
+    )
+    resume_sh.write_text(text, encoding="utf-8")
+    resume_sh.chmod(0o755)
+
+    # Kill the old pane if alive — the session is on disk, so nothing is lost.
+    old_pane = run.pane_id
+    if old_pane:
+        try:
+            if _is_alive(run, _live_panes(tm)):
+                tm.kill_window(old_pane)
+                time.sleep(0.3)
+        except TmuxError:
+            pass  # pane may have died between checks; not fatal
+
+    # Clear the old Stop-hook sentinel — the resume is a fresh turn.
+    sentinel = _stop_sentinel_path(run)
+    try:
+        sentinel.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    watch_mode = _normalize_watch(watch, cfg)
+
+    try:
+        pane_id = tm.new_window(
+            session=run.session,
+            window_name=run.window,
+            cwd=run.cwd,
+            command=str(resume_sh),
+        )
+    except TmuxError as exc:
+        raise ToolError(f"tmux resume launch failed: {exc}") from exc
+
+    pane_pid = tm.pane_pid(pane_id)
+    update_run_pane(run, pane_id, pane_pid=pane_pid)
+
+    output_log = _start_output_log(tm, run) if cfg.pipe_logs else ""
+    watch_info = _apply_watch(tm, cfg, run, watch_mode)
+
+    time.sleep(settle_seconds)
+
+    # Re-ensure the Stop hook is installed (it already is, since the run_dir
+    # and stop-hook.sh are unchanged, but this is idempotent and cheap).
+    _install_stop_hook(run, run.cwd, cfg)
+
+    try:
+        raw_output = tm.capture_pane(pane_id, lines=100)
+        live = _live_panes(tm)
+        alive = _is_alive(run, live)
+        current_command = tm.pane_command(pane_id)
+    except TmuxError:
+        raw_output = ""
+        alive = False
+        current_command = None
+
+    return _json(
+        {
+            "run_id": run.run_id,
+            "pane_id": pane_id,
+            "target": f"{run.session}:{run.window}",
+            "session": run.session,
+            "window": run.window,
+            "cli": run.cli,
+            "cwd": str(run.cwd),
+            "session_id": run.session_id,
+            "session_id_status": run.session_id_status,
+            "resumed": True,
+            "alive": alive,
+            "current_command": current_command or "",
+            "initial_output": _tail(raw_output, 20),
+            "output_log": output_log,
+            **watch_info,
         }
     )
 
@@ -1098,6 +1571,7 @@ def register_tools(cfg: ServerConfig | None = None) -> None:
         "watch_subagent",
         "list_subagents",
         "send_to_subagent",
+        "resume_subagent",
         "stop_subagent",
         "sweep_stale_subagents",
     ):
@@ -1111,6 +1585,7 @@ def register_tools(cfg: ServerConfig | None = None) -> None:
     mcp.tool(watch_subagent, annotations=_tip("watch_subagent"))
     mcp.tool(list_subagents, annotations=_tip("list_subagents"))
     mcp.tool(send_to_subagent, annotations=_tip("send_to_subagent"))
+    mcp.tool(resume_subagent, annotations=_tip("resume_subagent"))
     mcp.tool(stop_subagent, annotations=_tip("stop_subagent"))
     mcp.tool(sweep_stale_subagents, annotations=_tip("sweep_stale_subagents"))
 

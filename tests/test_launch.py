@@ -118,7 +118,9 @@ def test_launch_and_capture(env):
     # Inspect the side-channel log: the exact prompt should have arrived.
     time.sleep(0.5)
     data = json.loads(env["log"].read_text().splitlines()[0])
-    assert data["prompt"] == "hello there fake claude!"
+    # Phase 1.1: the standing RESULT.md instruction is appended to the prompt.
+    assert data["prompt"].startswith("hello there fake claude!")
+    assert "RESULT.md" in data["prompt"]
     assert "--dangerously-skip-permissions" in data["argv"]
     assert data["argv"][data["argv"].index("--model") + 1] == "opus"
 

@@ -81,4 +81,7 @@ def test_prompt_persisted(tmp_path):
         extra_args=[],
     )
     runner.write_wrapper("rid", tmp_path / "cwd")
-    assert (run_dir / "prompt.md").read_text(encoding="utf-8") == "保存\nПроверка"
+    # Phase 1.1: the standing RESULT.md instruction is appended to the prompt.
+    content = (run_dir / "prompt.md").read_text(encoding="utf-8")
+    assert content.startswith("保存\nПроверка")
+    assert "RESULT.md" in content
