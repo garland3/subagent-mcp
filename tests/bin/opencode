@@ -10,6 +10,15 @@ import time
 def main() -> None:
     log_path = os.environ.get("SUBAGENT_TEST_LOG")
 
+    # Handle `opencode session list` for post-launch id capture (Phase 0.1).
+    # The real opencode enumerates sessions here; the fake returns an empty
+    # list so the capture finds no match and records "capture_failed" — the
+    # visible failure mode the design calls out. Returning quickly (no sleep)
+    # keeps the test fast.
+    if len(sys.argv) >= 3 and sys.argv[1] == "session" and sys.argv[2] == "list":
+        print("[]")
+        return
+
     # Parse just enough to extract --prompt value.
     prompt: str | None = None
     i = 1

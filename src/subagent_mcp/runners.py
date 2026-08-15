@@ -35,6 +35,7 @@ class CLIRunner:
         dangerous: bool = True,
         extra_args: list[str] | None = None,
         executable: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         if cli not in self._CLIs:
             raise RunnerError(f"Unsupported cli {cli!r}; choose from {self._CLIs}")
@@ -51,6 +52,11 @@ class CLIRunner:
         self.agent = agent
         self.dangerous = dangerous
         self.extra_args = extra_args or []
+        # CLI conversation id. For claude this is minted by the caller and
+        # passed as ``--session-id <uuid>`` so the run is resumable from the
+        # first moment. opencode has no pre-assign flag, so this stays None
+        # here and the id is captured post-launch instead.
+        self.session_id = session_id
 
         # Always persist the full prompt to disk.
         self._prompt_file = run_dir / "prompt.md"
@@ -80,6 +86,11 @@ class CLIRunner:
         if self.cli == "claude":
             if self.dangerous:
                 argv.append(("--dangerously-skip-permissions", False))
+            # Pre-assign the claude conversation id so the run is resumable
+            # from the first moment. opencode has no equivalent flag; its id
+            # is captured post-launch instead (see server.py).
+            if self.session_id:
+                argv.extend([("--session-id", False), (self.session_id, False)])
             if self.model:
                 argv.extend([("--model", False), (self.model, False)])
             if self.agent:
@@ -153,6 +164,7 @@ def build_runner(
     dangerous: bool = True,
     extra_args: list[str] | None = None,
     executable: str | None = None,
+    session_id: str | None = None,
 ) -> CLIRunner:
     return CLIRunner(
         cli=cli,
@@ -164,4 +176,5 @@ def build_runner(
         dangerous=dangerous,
         extra_args=extra_args,
         executable=executable,
+        session_id=session_id,
     )

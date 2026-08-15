@@ -57,12 +57,29 @@ class ServerConfig:
     runs_keep_max: int = 200
     runs_max_age_days: float = 14.0
 
+    # Roots of the CLI session stores, used for transcript-based state
+    # derivation (Phase 0.2). ``None`` resolves to the per-user default at
+    # read time. Override these in tests to point at a tmp directory so tests
+    # never pick up real transcripts from the host.
+    #   claude_projects_root  -> ~/.claude/projects/<cwd-slug>/<uuid>.jsonl
+    #   opencode_state_root    -> ~/.local/share/opencode/opencode.db
+    claude_projects_root: Path | None = None
+    opencode_state_root: Path | None = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", self.root.resolve())
         object.__setattr__(self, "runs_root", self.runs_root.resolve())
         object.__setattr__(
             self, "allowed_roots", tuple(Path(p).expanduser().resolve() for p in self.allowed_roots)
         )
+        if self.claude_projects_root is not None:
+            object.__setattr__(
+                self, "claude_projects_root", self.claude_projects_root.resolve()
+            )
+        if self.opencode_state_root is not None:
+            object.__setattr__(
+                self, "opencode_state_root", self.opencode_state_root.resolve()
+            )
 
 
 def _default_allowed_roots() -> tuple[Path, ...]:

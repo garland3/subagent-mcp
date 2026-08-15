@@ -16,16 +16,38 @@ class RunsError(Exception):
 
 @dataclass
 class Run:
-    """In-memory handle for a single subagent launch."""
+    """In-memory handle for a single subagent launch.
+
+    Field naming note for downstream consumers (e.g. a future resume_subagent):
+
+    ``session`` is the **tmux** session name — a short string like ``atlas``.
+    ``session_id`` is the **CLI conversation id** — a UUID that makes the run
+    resumable via ``claude --resume <id>`` / ``opencode run -s <id>``. They are
+    different things and must not be conflated.
+    """
 
     run_id: str
     run_dir: Path
     cwd: Path
     cli: str
+    # tmux session name (NOT the CLI conversation id — see session_id).
     session: str
     window: str
     pane_id: str = ""
     pane_pid: int | None = None
+    # CLI session id — the durable, resumable conversation handle.
+    # For claude this is minted by us and passed as --session-id at launch.
+    # For opencode this is captured post-launch from ``opencode session list``
+    # or the SQLite DB at ~/.local/share/opencode/opencode.db (opencode has no
+    # pre-assign flag). Empty if the id was never obtained.
+    session_id: str = ""
+    # Provenance of session_id:
+    #   "minted"         — we generated the uuid and passed --session-id (claude)
+    #   "captured"       — we found the id post-launch (opencode)
+    #   "capture_failed" — opencode capture failed; the run is NOT resumable
+    #                      through us and the failure is visible in this field
+    #   ""               — not attempted (e.g. dry run, or old record)
+    session_id_status: str = ""
     model: str | None = None
     agent: str | None = None
     task: str | None = None
@@ -42,6 +64,8 @@ class Run:
             "window": self.window,
             "pane_id": self.pane_id,
             "pane_pid": self.pane_pid,
+            "session_id": self.session_id,
+            "session_id_status": self.session_id_status,
             "model": self.model,
             "agent": self.agent,
             "task": self.task,
@@ -60,6 +84,8 @@ class Run:
             window=data["window"],
             pane_id=data.get("pane_id", ""),
             pane_pid=data.get("pane_pid"),
+            session_id=data.get("session_id", ""),
+            session_id_status=data.get("session_id_status", ""),
             model=data.get("model"),
             agent=data.get("agent"),
             task=data.get("task"),
@@ -140,6 +166,8 @@ def create_run_dir(
     agent: str | None,
     task: str | None,
     argv: list[str],
+    session_id: str = "",
+    session_id_status: str = "",
 ) -> Run:
     runs_root.mkdir(parents=True, exist_ok=True)
     run_id = make_run_id(f"{session}-{window}" if task is None else task)
@@ -158,6 +186,8 @@ def create_run_dir(
         cli=cli,
         session=session,
         window=window,
+        session_id=session_id,
+        session_id_status=session_id_status,
         model=model,
         agent=agent,
         task=task,
@@ -184,6 +214,20 @@ def window_base(task: str | None, prompt: str) -> str:
 def update_run_pane(run: Run, pane_id: str, pane_pid: int | None = None) -> None:
     run.pane_id = pane_id
     run.pane_pid = pane_pid
+    run.write_meta()
+
+
+def update_run_session(
+    run: Run, session_id: str, session_id_status: str
+) -> None:
+    """Record the CLI conversation id on the run, persisting to meta.json.
+
+    Used after a post-launch capture (opencode) or to update the status if a
+    capture fails. The status is what makes a failed capture visible rather
+    than silent — see ``Run.session_id_status``.
+    """
+    run.session_id = session_id
+    run.session_id_status = session_id_status
     run.write_meta()
 
 
@@ -270,3 +314,217 @@ def prune_runs(
 
 def as_dict(run: Run) -> dict[str, Any]:
     return run.to_meta()
+
+
+# ---------------------------------------------------------------------------
+# Transcript-based state derivation (Phase 0.2).
+#
+# The CLI's own persisted transcript is the idle/working signal — NOT the tmux
+# TUI. A file works identically whether the pane is alive, closed, or running
+# in a sandboxed pod, which is why this mechanism is the one that has to
+# survive containerisation.
+#
+# claude writes ~/.claude/projects/<cwd-with-slashes-as-dashes>/<uuid>.jsonl
+#   e.g. cwd /home/garlan/ATLAS-GROUP -> dir -home-garlan-ATLAS-GROUP
+# opencode stores sessions in ~/.local/share/opencode/opencode.db (SQLite)
+#   plus snapshot/ and tool-output/ subdirectories.
+# ---------------------------------------------------------------------------
+
+# Quiescence window: if the transcript mtime is older than this, the run is
+# treated as idle even if we cannot parse the last record. Tuned to the
+# streaming cadence of both CLIs (a working agent touches the file every few
+# seconds); a paused-for-thought turn may briefly look idle, which is safe —
+# idle is the conservative, low-noise verdict.
+_QUIESCE_SECONDS = 15.0
+
+
+def _claude_transcript_path(run: Run, root: Path) -> Path:
+    """Path to claude's per-session JSONL transcript for this run.
+
+    claude encodes the cwd by replacing ``/`` with ``-`` (so
+    ``/home/garlan/ATLAS-GROUP`` -> ``-home-garlan-ATLAS-GROUP``) and stores
+    one ``<session-uuid>.jsonl`` file per session under that directory.
+    """
+    cwd_slug = str(run.cwd).replace("/", "-")
+    return root / cwd_slug / f"{run.session_id}.jsonl"
+
+
+def _read_last_jsonl_line(path: Path) -> str:
+    """Read the last non-empty line of a (possibly large) JSONL file.
+
+    Reads only the trailing 64 KiB so a multi-megabyte transcript does not
+    have to be loaded in full on every check.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            if size == 0:
+                return ""
+            read = min(65536, size)
+            fh.seek(size - read)
+            chunk = fh.read(read)
+    except OSError:
+        return ""
+    for line in reversed(chunk.split(b"\n")):
+        if line.strip():
+            return line.decode("utf-8", errors="replace")
+    return ""
+
+
+def _claude_state(run: Run, root: Path) -> tuple[str, str]:
+    """Derive (state, last_activity_iso) from claude's JSONL transcript.
+
+    Returns ``("", "")`` when there is no transcript to read — e.g. the
+    session_id was never captured, or the transcript file has not appeared
+    yet. ``state`` is ``"working"`` or ``"idle"``.
+    """
+    if not run.session_id:
+        return "", ""
+    transcript = _claude_transcript_path(run, root)
+    if not transcript.is_file():
+        return "", ""
+    try:
+        mtime = transcript.stat().st_mtime
+    except OSError:
+        return "", ""
+    last_activity = datetime.fromtimestamp(mtime, timezone.utc).isoformat()
+
+    last_line = _read_last_jsonl_line(transcript)
+    if not last_line:
+        # File exists but is empty — the agent has just started and not
+        # written a record yet. Call it working rather than idle.
+        return "working", last_activity
+
+    try:
+        record = json.loads(last_line)
+    except json.JSONDecodeError:
+        # Unparseable tail: assume working so a transient write does not
+        # produce a false idle verdict (a wrong idle is worse than none).
+        return "working", last_activity
+
+    # Heuristic: an assistant record whose content has no tool_use block is a
+    # completed turn -> idle. Anything else (user follow-up, tool_result,
+    # assistant mid-turn with tool_use) is working. The JSONL schema is not
+    # a public contract, so this is intentionally tolerant of shape variation.
+    if isinstance(record, dict) and record.get("type") == "assistant":
+        message = record.get("message", {})
+        if isinstance(message, dict):
+            content = message.get("content", [])
+            if isinstance(content, str):
+                # Plain-text assistant turn -> idle.
+                return "idle", last_activity
+            if isinstance(content, list):
+                has_tool_use = any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
+                    for block in content
+                )
+                if not has_tool_use:
+                    return "idle", last_activity
+    # Fall back to mtime: a stale transcript is idle even mid-record.
+    if (time.time() - mtime) > _QUIESCE_SECONDS:
+        return "idle", last_activity
+    return "working", last_activity
+
+
+def _opencode_state(run: Run, root: Path) -> tuple[str, str]:
+    """Best-effort state from opencode's SQLite store.
+
+    The opencode DB schema is not a published contract, so this probes a few
+    common table/column names and returns ``("", "")`` on any mismatch rather
+    than crashing. Phase 1's ``Stop``-hook confirmation is the fallback that
+    does not depend on parsing this; the hook is what makes the idle verdict
+    robust for opencode. This function is the file-based rung of the same
+    ladder and is structured so the schema can be filled in once it is known.
+    """
+    if not run.session_id:
+        return "", ""
+    db_path = root / "opencode.db"
+    if not db_path.is_file():
+        return "", ""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path), timeout=2)
+    except Exception:
+        return "", ""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cursor.fetchall()}
+        msg_table = next(
+            (t for t in ("messages", "message", "chat_messages", "events") if t in tables),
+            None,
+        )
+        if msg_table is None:
+            return "", ""
+        cursor.execute(f"PRAGMA table_info({msg_table})")
+        cols = {row[1] for row in cursor.fetchall()}
+        sid_col = next(
+            (c for c in ("session_id", "session", "sessionId") if c in cols), None
+        )
+        if sid_col is None:
+            return "", ""
+        ts_col = next(
+            (c for c in ("created_at", "created", "timestamp", "time", "updated_at") if c in cols),
+            None,
+        )
+        role_col = next(
+            (c for c in ("role", "type", "kind") if c in cols), None
+        )
+        select_expr = role_col if role_col is not None else "'*'"
+        if ts_col:
+            query = (
+                f"SELECT {select_expr}, {ts_col} FROM {msg_table} "
+                f"WHERE {sid_col} = ? ORDER BY {ts_col} DESC LIMIT 1"
+            )
+        else:
+            query = (
+                f"SELECT {select_expr} FROM {msg_table} "
+                f"WHERE {sid_col} = ? ORDER BY rowid DESC LIMIT 1"
+            )
+        cursor.execute(query, (run.session_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return "", ""
+        last_ts = str(row[-1]) if ts_col and row else ""
+        role = str(row[0]) if role_col and row else ""
+        # Heuristic mirror of the claude path: an assistant's last record is
+        # idle unless it carries a tool call (which we cannot cheaply detect
+        # without knowing the content column). Be conservative: assistant =>
+        # idle only if the row is old; otherwise working.
+        if role.lower() == "assistant" and ts_col:
+            return "idle", last_ts
+        return "working", last_ts
+    except Exception:
+        return "", ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def derive_state(
+    run: Run,
+    *,
+    claude_projects_root: Path | None = None,
+    opencode_state_root: Path | None = None,
+) -> tuple[str, str]:
+    """Derive ``(state, last_activity)`` from the CLI's own transcript file.
+
+    ``state`` is ``"working"``, ``"idle"``, or ``""`` (unknown — no transcript
+    available yet). ``last_activity`` is an ISO timestamp string or ``""``.
+
+    This reads the CLI's persisted transcript, not the tmux TUI, so it works
+    the same whether the pane is alive, closed, or running in a sandboxed
+    pod without a TTY. The pane-alive check (in server.py) is a separate
+    signal that this complements, not replaces.
+    """
+    if run.cli == "claude":
+        root = claude_projects_root or (Path.home() / ".claude" / "projects")
+        return _claude_state(run, root)
+    if run.cli == "opencode":
+        root = opencode_state_root or (Path.home() / ".local" / "share" / "opencode")
+        return _opencode_state(run, root)
+    return "", ""

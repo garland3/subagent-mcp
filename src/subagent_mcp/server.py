@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -20,9 +22,11 @@ from .runs import (
     choose_window_name,
     create_run_dir,
     delete_run_dirs,
+    derive_state,
     prune_runs,
     registry as runs_registry,
     update_run_pane,
+    update_run_session,
     window_base,
 )
 from .tmuxio import Tmux, TmuxError
@@ -195,11 +199,201 @@ def _active_count(tm: Tmux, cfg: ServerConfig | None = None) -> int:
     return sum(1 for run in reg.values() if _is_alive(run, live))
 
 
-def _tail(text: str, lines: int = 40) -> str:
+def _state_for(run: Run, cfg: ServerConfig) -> tuple[str, str]:
+    """Transcript-derived (state, last_activity) for a run, via runs.derive_state.
+
+    Reads the CLI's own persisted transcript, not the tmux TUI, so this works
+    whether or not the pane is alive. See runs.derive_state for the per-CLI
+    paths and the quiescence/idle heuristics.
+    """
+    return derive_state(
+        run,
+        claude_projects_root=cfg.claude_projects_root,
+        opencode_state_root=cfg.opencode_state_root,
+    )
+
+
+# A failed opencode capture must be visible in the run record, not silent —
+# an unresumable run is the failure mode the design calls out (§3.3 risk 5).
+# This helper never raises; it returns the id, or None if no matching session
+# was found. The caller records the outcome on the Run.
+def _capture_opencode_session_id(
+    run: Run,
+    executable: str,
+    *,
+    opencode_state_root: Path | None = None,
+    timeout: float = 5.0,
+) -> str | None:
+    """Best-effort discovery of the opencode session id right after launch.
+
+    opencode does not expose a pre-assign flag (see §3.1 of the design), so
+    the id has to be captured post-launch. Tries ``opencode session list``
+    first (preferring JSON output), then falls back to scanning the SQLite
+    DB under ``opencode_state_root``. Returns None on any failure — the
+    caller records ``capture_failed``.
+
+    ``opencode_state_root`` defaults to ``~/.local/share/opencode`` for
+    production use; tests override it so they never touch the host DB.
+    """
+    # Try the CLI's own session enumeration first.
+    for argv in (
+        [executable, "session", "list", "--json"],
+        [executable, "session", "list"],
+    ):
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0:
+            continue
+        sid = _match_opencode_session(proc.stdout, run)
+        if sid:
+            return sid
+
+    # Fall back to the SQLite DB directly. Use the configured root so tests
+    # never touch the host's real opencode state.
+    root = opencode_state_root or (Path.home() / ".local" / "share" / "opencode")
+    db_path = root / "opencode.db"
+    if db_path.is_file():
+        sid = _match_opencode_session_db(db_path, run)
+        if sid:
+            return sid
+    return None
+
+
+def _match_opencode_session(text: str, run: Run) -> str | None:
+    """Find the session id in ``opencode session list`` output for this run."""
+    raw = text.strip()
+    if not raw:
+        return None
+    # Prefer a structured JSON response.
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return _find_uuid(raw)
+
+    sessions: list[Any]
+    if isinstance(data, list):
+        sessions = data
+    elif isinstance(data, dict) and isinstance(data.get("sessions"), list):
+        sessions = data["sessions"]
+    elif isinstance(data, dict):
+        sessions = [data]
+    else:
+        sessions = []
+
+    cwd_str = str(run.cwd)
+    fallback: str | None = None
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id") or s.get("session_id") or s.get("uuid")
+        if not sid:
+            continue
+        s_cwd = s.get("cwd") or s.get("path") or s.get("directory") or ""
+        if s_cwd:
+            try:
+                if Path(s_cwd).resolve() == Path(cwd_str).resolve():
+                    return str(sid)
+            except Exception:
+                pass
+        if fallback is None:
+            fallback = str(sid)
+    return fallback
+
+
+def _match_opencode_session_db(db_path: Path, run: Run) -> str | None:
+    """Last-resort: probe the opencode SQLite DB for the session id."""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path), timeout=2)
+    except Exception:
+        return None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cursor.fetchall()}
+        sess_table = next(
+            (t for t in ("sessions", "session") if t in tables), None
+        )
+        if sess_table is None:
+            return None
+        cursor.execute(f"PRAGMA table_info({sess_table})")
+        cols = {row[1] for row in cursor.fetchall()}
+        id_col = next(
+            (c for c in ("id", "session_id", "uuid") if c in cols), None
+        )
+        ts_col = next(
+            (c for c in ("created_at", "created", "timestamp", "time") if c in cols),
+            None,
+        )
+        if id_col is None:
+            return None
+        # Take the most recent row; matching by cwd is unreliable without
+        # knowing the column name, so the caller prefers `opencode session list`.
+        order = ts_col or "rowid"
+        cursor.execute(
+            f"SELECT {id_col} FROM {sess_table} ORDER BY {order} DESC LIMIT 5"
+        )
+        rows = cursor.fetchall()
+        if rows:
+            return str(rows[0][0])
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _find_uuid(text: str) -> str | None:
+    """Extract the first UUID-like substring from text, or None."""
+    match = re.search(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        text,
+    )
+    return match.group(0) if match else None
+
+
+def _tail(text: str, lines: int = 40, *, strip_box: bool = True) -> str:
+    """Return the last ``lines`` of ``text``, with TUI chrome removed.
+
+    Box-drawing and block-element characters are ~14% of pane-capture tokens
+    and carry no signal about whether the agent is alive or blocked. Stripping
+    them (and dropping lines that become whitespace-only) keeps the
+    ``initial_output`` payload focused on what the model actually needs to
+    see. The default ``lines`` cap is 40; ``launch_subagent`` asks for fewer.
+    """
+    if strip_box:
+        text = _strip_box_drawing(text)
     parts = text.splitlines()
     if len(parts) > lines:
         return "\n".join(parts[-lines:])
     return text
+
+
+# Unicode box-drawing block (U+2500–U+257F) and block elements (U+2580–U+259F).
+# These are the TUI border/shade/progress characters; stripping them does not
+# lose any agent output. The leading-deco marks used by _detect_blocked_output
+# (❯>●·▶) are handled separately there and are NOT stripped here — they are
+# sometimes meaningful inside an output line.
+_BOX_CHARS = frozenset(chr(c) for c in range(0x2500, 0x25A0))
+
+
+def _strip_box_drawing(text: str) -> str:
+    """Remove TUI border characters and drop the lines that become empty."""
+    kept: list[str] = []
+    for line in text.splitlines():
+        cleaned = "".join(c for c in line if c not in _BOX_CHARS)
+        if cleaned.strip():
+            kept.append(cleaned.rstrip())
+    return "\n".join(kept)
 
 
 def _read_prompt(
@@ -342,7 +536,17 @@ def launch_subagent(
     watch: Annotated[str | None, Field(description="'off' = detached (default); 'switch' = pull an attached tmux client to this window; 'terminal' = open a terminal emulator on it")] = None,
     dry_run: Annotated[bool, Field(description="Return the generated wrapper without launching")] = False,
 ) -> str:
-    """Launch a coding-CLI subagent in a tmux window (detached unless watch is set)."""
+    """Launch a coding-CLI subagent (claude or opencode) in a detached tmux window.
+
+    Use this instead of `tmux new-window` so the run gets a minted or captured
+    session_id (resumable later via claude --resume / opencode run -s), a run
+    directory holding prompt.md and output.log, and liveness reconciliation.
+    Returns a run_id (e.g. 20260815-130009-fixit) plus the sess:win target;
+    pass either back to the other subagent_* tools.
+
+    The handle is the run_id or the full session:window (e.g. atlas:fixit) —
+    never a bare window name, which can resolve to the wrong session.
+    """
     cfg = _cfg()
     tm = _tmux(cfg)
 
@@ -369,6 +573,19 @@ def launch_subagent(
     if prompt_mode not in ("inline", "pointer"):
         raise ToolError("prompt_mode must be 'inline' or 'pointer'")
 
+    # Mint the CLI conversation id up front when the CLI supports it. claude
+    # takes --session-id <uuid>; opencode has no pre-assign flag and the id is
+    # captured post-launch instead. Recording both on the Run is the key gap
+    # from §3.3: without this, resuming a run means finding the session by
+    # hand. A failed opencode capture is recorded as "capture_failed" — the
+    # visible failure mode — rather than left silently empty.
+    session_id = ""
+    session_id_status = ""
+    if cli == "claude":
+        session_id = str(uuid.uuid4())
+        session_id_status = "minted"
+    # opencode: session_id stays "" here; captured after the pane is up.
+
     effective_session = session or cwd_path.name or "subagent"
     window_base_name = window or window_base(task, prompt_text)
     window = choose_window_name(
@@ -394,6 +611,8 @@ def launch_subagent(
             agent=agent,
             task=task,
             argv=[],  # filled after we build the runner
+            session_id=session_id,
+            session_id_status=session_id_status,
         )
         runner = build_runner(
             cli=cli,
@@ -405,6 +624,7 @@ def launch_subagent(
             dangerous=dangerous,
             extra_args=_parse_extra_args(extra_args),
             executable=executable,
+            session_id=session_id,
         )
         run.argv = runner.argv()
         run.write_meta()
@@ -424,6 +644,8 @@ def launch_subagent(
                 "cwd": str(cwd_path),
                 "session": run.session,
                 "window": run.window,
+                "session_id": run.session_id,
+                "session_id_status": run.session_id_status,
                 "watch": watch_mode,
                 "dry_run": True,
             }
@@ -448,6 +670,19 @@ def launch_subagent(
     watch_info = _apply_watch(tm, cfg, run, watch_mode)
 
     time.sleep(settle_seconds)
+
+    # opencode: capture the session id post-launch (no pre-assign flag). A
+    # failed capture is recorded visibly on the Run so the run is not
+    # silently unresumable.
+    if cli == "opencode" and not run.session_id:
+        captured = _capture_opencode_session_id(
+            run, executable, opencode_state_root=cfg.opencode_state_root
+        )
+        if captured:
+            update_run_session(run, captured, "captured")
+        else:
+            update_run_session(run, "", "capture_failed")
+
     live: set[tuple[str, int]] = set()
     try:
         raw_output = tm.capture_pane(pane_id, lines=100)
@@ -483,9 +718,16 @@ def launch_subagent(
             "executable": executable,
             "run_dir": str(run.run_dir),
             "output_log": output_log,
+            # The CLI conversation id — the durable, resumable handle.
+            # Empty with status="capture_failed" means the run is NOT
+            # resumable through us; the human must find the session by hand.
+            "session_id": run.session_id,
+            "session_id_status": run.session_id_status,
             "alive": alive,
             "current_command": current_command or "",
-            "initial_output": _tail(raw_output, 40),
+            # Box-drawing stripped and capped to keep the result focused on
+            # the alive/blocked signal rather than TUI borders.
+            "initial_output": _tail(raw_output, 20),
             "blocked": blocked,
             "blocked_reason": blocked_reason or "",
             "pruned_runs": len(pruned),
@@ -502,13 +744,26 @@ def check_subagent(
     handle: Annotated[str, Field(description="run_id, pane id, or sess:win target")],
     lines: Annotated[int, Field(description="How many lines to capture from the pane top")] = 100,
 ) -> str:
-    """Capture the last output from a running subagent."""
+    """Capture the last output from a subagent and report state, liveness, and whether it is blocked on an interactive prompt.
+
+    Use this instead of `tmux capture-pane` so you get the transcript-derived
+    state (working|idle, not just TUI chrome) and so the run is reconciled
+    if the pane is gone (a closed pane returns a dead snapshot, not an error).
+
+    The handle is the run_id from launch_subagent or the full session:window
+    (e.g. atlas:fixit) — never a bare window name, which can resolve to the
+    wrong session.
+    """
     cfg = _cfg()
     tm = _tmux(cfg)
     run = _resolve_handle(handle, cfg)
 
     if not run.pane_id:
         raise ToolError(f"Run {run.run_id!r} has no pane id (dry run?)")
+
+    # Transcript state is derived from the CLI's own persisted transcript, so
+    # it is available even when the pane is no longer alive.
+    state, last_activity = _state_for(run, cfg)
 
     try:
         output = tm.capture_pane(run.pane_id, lines=lines)
@@ -524,9 +779,13 @@ def check_subagent(
                 "target": f"{run.session}:{run.window}",
                 "session": run.session,
                 "window": run.window,
+                "session_id": run.session_id,
+                "session_id_status": run.session_id_status,
                 "alive": False,
                 "current_command": "",
                 "output": "",
+                "state": state,
+                "last_activity": last_activity,
                 "blocked": False,
                 "blocked_reason": "",
             }
@@ -544,9 +803,13 @@ def check_subagent(
             "target": f"{run.session}:{run.window}",
             "session": run.session,
             "window": run.window,
+            "session_id": run.session_id,
+            "session_id_status": run.session_id_status,
             "alive": alive,
             "current_command": current_command or "",
             "output": output,
+            "state": state,
+            "last_activity": last_activity,
             "blocked": blocked,
             "blocked_reason": blocked_reason or "",
         }
@@ -557,7 +820,15 @@ def watch_subagent(
     handle: Annotated[str, Field(description="run_id, pane id, or sess:win target")],
     mode: Annotated[str, Field(description="'switch' pulls an attached tmux client to this window; 'terminal' opens a terminal emulator on it; 'off' just returns the attach commands")] = "switch",
 ) -> str:
-    """Put an already-running subagent on screen, or report how to attach to it."""
+    """Put a running subagent on screen, or report how to attach to it.
+
+    Use this instead of `tmux attach`/`tmux switch-client` so the run is
+    resolved by handle (not by guessing the window name) and the attach
+    command is returned even when no client is attached.
+
+    The handle is the run_id or the full session:window (e.g. atlas:fixit) —
+    never a bare window name, which can resolve to the wrong session.
+    """
     cfg = _cfg()
     tm = _tmux(cfg)
     run = _resolve_handle(handle, cfg)
@@ -584,7 +855,14 @@ def watch_subagent(
 def list_subagents(
     session: Annotated[str | None, Field(description="Filter to one tmux session")] = None,
 ) -> str:
-    """List launched subagents and reconcile them with live tmux pane state."""
+    """List all launched subagents with their run_id, state (working|idle), liveness, and age.
+
+    Use this instead of `tmux list-windows` so you get the recorded run
+    metadata and the transcript-derived state, not just live window names.
+    Returns run_id handles you can pass to the other subagent_* tools. The
+    state is derived from the CLI's own transcript and is reported even for
+    runs whose panes are no longer alive.
+    """
     cfg = _cfg()
     tm = _tmux(cfg)
     reg = _load_registry(cfg)
@@ -605,6 +883,10 @@ def list_subagents(
                 age = str(int((now - start).total_seconds())) + "s"
             except Exception:
                 age = ""
+        # Transcript state is derived from the CLI's persisted transcript and
+        # is independent of pane liveness — this is the signal that has to
+        # survive containerisation (no TTY required).
+        state, last_activity = _state_for(run, cfg)
         items.append(
             {
                 "run_id": run.run_id,
@@ -615,8 +897,12 @@ def list_subagents(
                 "cli": run.cli,
                 "cwd": str(run.cwd),
                 "task": run.task,
+                "session_id": run.session_id,
+                "session_id_status": run.session_id_status,
                 "alive": alive,
                 "age": age,
+                "state": state,
+                "last_activity": last_activity,
             }
         )
 
@@ -628,7 +914,13 @@ def send_to_subagent(
     text: Annotated[str, Field(description="Text to type into the subagent")],
     submit: Annotated[bool, Field(description="Press Enter after pasting")] = True,
 ) -> str:
-    """Send a follow-up message to a running subagent."""
+    """Send a follow-up message to a running subagent's pane (paste + optional Enter).
+
+    Use this instead of `tmux send-keys` so the run is resolved by handle and
+    the paste uses a named buffer (no shell expansion of the text). The
+    handle is the run_id or the full session:window (e.g. atlas:fixit) —
+    never a bare window name, which can resolve to the wrong session.
+    """
     cfg = _cfg()
     tm = _tmux(cfg)
     run = _resolve_handle(handle, cfg)
@@ -653,24 +945,24 @@ def stop_subagent(
     handle: Annotated[str, Field(description="run_id, pane id, or sess:win target")],
     kill_window: Annotated[bool, Field(description="Kill the tmux window instead of sending Ctrl-C")] = False,
 ) -> str:
-    """Interrupt or kill a running subagent."""
+    """Stop a subagent by sending Ctrl-C (default) or killing its tmux window.
+
+    A pane that is already gone is SUCCESS, not an error: the run directory is
+    reconciled (removed from the registry) and a dead snapshot is returned.
+    This fixes the measured 33% stop_subagent error rate, whose cause was
+    stale run_ids pointing at panes already gone — not lingering panes.
+
+    Use this instead of `tmux send-keys C-c`/`tmux kill-window` so the run is
+    resolved by handle and dead panes are cleaned up rather than raising.
+
+    The handle is the run_id or the full session:window (e.g. atlas:fixit) —
+    never a bare window name, which can resolve to the wrong session.
+    """
     cfg = _cfg()
     tm = _tmux(cfg)
     run = _resolve_handle(handle, cfg)
 
-    try:
-        if kill_window:
-            # Kill by pane id so a reused window name in another session is never hit.
-            tm.kill_window(run.pane_id)
-        else:
-            tm.send_keys(run.pane_id, "C-c")
-    except TmuxError as exc:
-        raise ToolError(f"tmux stop failed: {exc}") from exc
-
-    time.sleep(0.5)
-    try:
-        return check_subagent(handle=run.pane_id, lines=20)
-    except ToolError:
+    def _dead_snapshot(*, reconciled: bool) -> str:
         return _json(
             {
                 "run_id": run.run_id,
@@ -679,12 +971,48 @@ def stop_subagent(
                 "session": run.session,
                 "window": run.window,
                 "alive": False,
+                "reconciled": reconciled,
                 "current_command": "",
                 "output": "",
+                "state": "",
                 "blocked": False,
                 "blocked_reason": "",
             }
         )
+
+    # No pane id means the run was a dry run or never attached — reconcile the
+    # registry entry rather than trying to stop nothing.
+    if not run.pane_id:
+        delete_run_dirs(cfg.runs_root, [run.run_id])
+        return _dead_snapshot(reconciled=True)
+
+    live = _live_panes(tm)
+    if not _is_alive(run, live):
+        # The pane is already gone. The user asked us to stop it; success is
+        # the right answer, and we drop the stale registry entry instead of
+        # raising ToolError (the old 33%-failure mode).
+        delete_run_dirs(cfg.runs_root, [run.run_id])
+        return _dead_snapshot(reconciled=True)
+
+    try:
+        if kill_window:
+            # Kill by pane id so a reused window name in another session is never hit.
+            tm.kill_window(run.pane_id)
+        else:
+            tm.send_keys(run.pane_id, "C-c")
+    except TmuxError:
+        # Race: the pane died between the alive check and the signal. Re-check
+        # and reconcile if it is now gone; otherwise re-raise the real error.
+        if not _is_alive(run, _live_panes(tm)):
+            delete_run_dirs(cfg.runs_root, [run.run_id])
+            return _dead_snapshot(reconciled=True)
+        raise
+
+    time.sleep(0.5)
+    try:
+        return check_subagent(handle=run.pane_id, lines=20)
+    except ToolError:
+        return _dead_snapshot(reconciled=False)
 
 
 def sweep_stale_subagents(
@@ -694,7 +1022,10 @@ def sweep_stale_subagents(
     """Delete run records for subagents whose tmux panes are no longer alive.
 
     list_subagents marks dead panes but leaves their run directories on disk;
-    this tool reaps them. Live subagents are never touched.
+    this tool reaps them. Live subagents are never touched. Use this instead
+    of manually pruning runs/ so only real runs with meta.json are touched.
+    Pass dry_run=True to preview, or use list_subagents first to see what is
+    stale.
     """
     cfg = _cfg()
     tm = _tmux(cfg)
