@@ -38,6 +38,19 @@ class ServerConfig:
     # How long to wait for a follow-up paste before pressing Enter.
     follow_up_settle_seconds: float = 1.5
 
+    # Default visibility for a freshly launched subagent:
+    #   "off"      — detached tmux window, nothing happens on screen
+    #   "switch"   — pull an already-attached tmux client to the new window
+    #   "terminal" — open a terminal emulator attached to the new window
+    watch_default: str = "off"
+
+    # Terminal emulator used by watch="terminal" (None => autodetect).
+    terminal_command: str | None = None
+
+    # Tee each pane's output into <run_dir>/output.log so it can be tail -f'd
+    # and survives the pane's scrollback limit.
+    pipe_logs: bool = True
+
     # Retention for the runs/ directory. Finished (dead) runs beyond either
     # limit are deleted after a successful launch. Set either to 0 to disable
     # that half of the policy.

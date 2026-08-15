@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 class RunsError(Exception):
@@ -200,6 +200,40 @@ def _run_sort_key(run: Run) -> float:
         return 0.0
 
 
+def delete_run_dirs(runs_root: Path, run_ids: Iterable[str]) -> list[str]:
+    """Safely delete run directories for the given ids, preserving order.
+
+    Only real run directories sitting directly under runs_root that contain a
+    meta.json are touched. Deduplicates. Returns the removed ids in the order
+    given. Used by both ``prune_runs`` (retention GC) and the
+    ``sweep_stale_subagents`` tool (liveness GC).
+    """
+    runs_root = runs_root.resolve()
+    if not runs_root.is_dir():
+        return []
+    reg = discover_runs(runs_root)
+    removed: list[str] = []
+    seen: set[str] = set()
+    for run_id in run_ids:
+        if run_id in seen:
+            continue
+        seen.add(run_id)
+        run = reg.get(run_id)
+        if run is None:
+            continue
+        run_dir = run.run_dir.resolve()
+        # Only ever delete a real run directory sitting under runs_root.
+        if run_dir.parent != runs_root or not (run_dir / "meta.json").is_file():
+            continue
+        try:
+            shutil.rmtree(run_dir)
+        except OSError:
+            continue
+        removed.append(run_id)
+        _REGISTRY.pop(run_id, None)
+    return removed
+
+
 def prune_runs(
     runs_root: Path,
     *,
@@ -222,32 +256,16 @@ def prune_runs(
     everything = sorted(discover_runs(runs_root).values(), key=_run_sort_key)
     candidates = [run for run in everything if run.run_id not in protect]
 
-    doomed: list[Run] = []
+    doomed_ids: list[str] = []
     if max_age_days > 0:
         cutoff = time.time() - max_age_days * 86400
-        doomed.extend(run for run in candidates if _run_sort_key(run) < cutoff)
+        doomed_ids.extend(run.run_id for run in candidates if _run_sort_key(run) < cutoff)
     if keep_max > 0 and len(everything) > keep_max:
         # Oldest first, so the surplus is the head of the list.
         surplus = {run.run_id for run in everything[: len(everything) - keep_max]}
-        doomed.extend(run for run in candidates if run.run_id in surplus)
+        doomed_ids.extend(run.run_id for run in candidates if run.run_id in surplus)
 
-    removed: list[str] = []
-    seen: set[str] = set()
-    for run in doomed:
-        if run.run_id in seen:
-            continue
-        seen.add(run.run_id)
-        run_dir = run.run_dir.resolve()
-        # Only ever delete a real run directory sitting under runs_root.
-        if run_dir.parent != runs_root or not (run_dir / "meta.json").is_file():
-            continue
-        try:
-            shutil.rmtree(run_dir)
-        except OSError:
-            continue
-        removed.append(run.run_id)
-        _REGISTRY.pop(run.run_id, None)
-    return removed
+    return delete_run_dirs(runs_root, doomed_ids)
 
 
 def as_dict(run: Run) -> dict[str, Any]:

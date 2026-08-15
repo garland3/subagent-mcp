@@ -10,15 +10,19 @@ that is unnecessary — both `claude` and `opencode` accept the prompt on the
 command line — and the rest is bookkeeping a server should be doing for you.
 `launch_subagent` does the whole thing and hands back a handle.
 
-Requires `tmux` and at least one of `claude` / `opencode` on `PATH`.
+Requires `tmux` and at least one of `claude` / `opencode` installed (see
+[Finding the CLI](#finding-the-cli) — it does not have to be on the server
+process's `PATH`).
 
 ## Tools
 
-- `launch_subagent` — start `claude` or `opencode` in a detached tmux window
+- `launch_subagent` — start `claude` or `opencode` in a tmux window
 - `check_subagent` — capture the last N lines of output from a running subagent
+- `watch_subagent` — put a running subagent on screen (or report how to attach)
 - `list_subagents` — list all launched subagents and whether their panes are alive
 - `send_to_subagent` — paste a follow-up message into a live subagent
 - `stop_subagent` — send `Ctrl-C` (or kill the tmux window)
+- `sweep_stale_subagents` — delete run records for subagents whose panes are gone
 
 `launch_subagent` takes `prompt` (or `prompt_file`), `cwd`, `cli`, and optional
 `session` / `window` / `task` / `model` / `agent` / `extra_args`. Every launch
@@ -28,6 +32,56 @@ never lost to a scrollback buffer.
 
 Handles are interchangeable: a `run_id`, a tmux pane id (`%12`), or a
 `session:window` target all resolve to the same run.
+
+### Watching a subagent
+
+Runs are detached by default — that is what makes fanning out cheap, but it also
+means nothing appears on screen. Pass `watch` to `launch_subagent` (or call
+`watch_subagent` on a run that is already going) to change that:
+
+| `watch` | Effect |
+| --- | --- |
+| `off` (default) | Detached. The response still carries `attach_command`. |
+| `switch` | Pulls your already-attached tmux client to the new window. |
+| `terminal` | Opens a terminal emulator attached to the window. |
+
+`switch` is the one to reach for if you live inside tmux; it is a no-op that
+reports why when no client is attached, and it never fails a launch — the
+subagent is running either way, visibility is best-effort.
+
+`--watch-default` / `SUBAGENT_WATCH_DEFAULT` makes a mode the default for every
+launch, so "always show me what it's doing" is a server setting, not something
+to remember per call.
+
+Every response also hands back:
+
+- `attach_command` — `tmux attach -t sess:win`
+- `attach_read_only` — the same with `-r`, so watching cannot disturb the run
+- `output_log` — `<run_dir>/output.log`, a `pipe-pane` tee of everything the
+  pane printed. `tail -f` it to follow a run without attaching, and read it
+  afterwards for output that has already scrolled out of the pane's scrollback.
+  Disable with `--no-pipe-logs`.
+
+`terminal` autodetects kitty, wezterm, ghostty, alacritty, foot,
+gnome-terminal, konsole, xfce4-terminal, `x-terminal-emulator`, and xterm. Set
+`SUBAGENT_TERMINAL` to a template containing `{cmd}` to override, e.g.
+`kitty -- bash -c {cmd}`. It needs `DISPLAY`/`WAYLAND_DISPLAY` in the *server's*
+environment; without one it reports that and leaves the run detached.
+
+### Finding the CLI
+
+The subagent inherits the environment of whatever started the MCP server, which
+is often a desktop launcher with a stripped `PATH` — so a perfectly working
+`opencode` on your shell's `PATH` would die in the pane with `command not
+found` (exit 127). The server therefore resolves the CLI to an absolute path
+before launching, searching `PATH` plus the usual per-user install roots
+(`~/.opencode/bin`, `~/.claude/local`, `~/.local/bin`, `~/.bun/bin`,
+`~/.cargo/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, nvm's newest node), and
+exports that widened `PATH` inside `run.sh` for the CLI's own helpers.
+
+If it still cannot find one, the launch fails immediately with the list of
+directories searched, instead of leaving you a dead pane. Point it at a binary
+explicitly with `SUBAGENT_CLI_OPENCODE` / `SUBAGENT_CLI_CLAUDE`.
 
 ### Blocked detection
 
@@ -70,10 +124,20 @@ Every flag has a matching environment variable.
 | `--runs-keep-max` | `SUBAGENT_RUNS_KEEP_MAX` | `200` | Keep at most this many run dirs (`0` disables) |
 | `--runs-max-age-days` | `SUBAGENT_RUNS_MAX_AGE_DAYS` | `14` | Delete run dirs older than this (`0` disables) |
 | `--tmux-socket` | `SUBAGENT_TMUX_SOCKET` | default socket | Use a private tmux server |
+| `--watch-default` | `SUBAGENT_WATCH_DEFAULT` | `off` | Default visibility: `off` / `switch` / `terminal` |
+| `--terminal` | `SUBAGENT_TERMINAL` | autodetect | Terminal template for `watch=terminal`, e.g. `kitty -- bash -c {cmd}` |
+| `--no-pipe-logs` | `SUBAGENT_NO_PIPE_LOGS` | off | Stop teeing pane output into `<run_dir>/output.log` |
+| — | `SUBAGENT_CLI_OPENCODE` / `SUBAGENT_CLI_CLAUDE` | autodetect | Absolute path to a CLI binary |
 | `--host` / `--port` | `SUBAGENT_HOST` / `SUBAGENT_PORT` | `127.0.0.1:8100` | HTTP transport only |
 
 Retention runs on launch — the only operation that grows `runs/`. Both limits
 count every run on disk, but a run whose pane is still alive is never deleted.
+
+`sweep_stale_subagents` is the on-demand complement: it reaps run directories
+whose panes are no longer alive (the dead records `list_subagents` reports as
+`alive: false`). Pass `dry_run=true` to preview what would be cleared, or
+`session="atlas"` to scope it to one tmux session. Live subagents are never
+touched.
 
 ## Client registration
 
@@ -113,6 +177,8 @@ src/subagent_mcp/
   config.py      ServerConfig
   server.py      FastMCP tool definitions
   runners.py     claude/opencode argv and wrapper generation
+  cli_paths.py   locating CLI binaries a stripped PATH would miss
+  watching.py    tmux client switching and terminal-emulator launching
   tmuxio.py      thin wrapper around the tmux binary
   runs.py        per-run directory bookkeeping and retention
 ```

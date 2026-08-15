@@ -12,6 +12,7 @@ from subagent_mcp.server import (  # noqa: F401  — side-effects registration
     list_subagents,
     register_tools,
     stop_subagent,
+    sweep_stale_subagents,
 )
 from subagent_mcp.tmuxio import Tmux
 

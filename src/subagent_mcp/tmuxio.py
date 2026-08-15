@@ -4,6 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .cli_paths import augmented_path
+
 
 class TmuxError(Exception):
     """A tmux command failed."""
@@ -18,9 +20,14 @@ class Tmux:
 
     def __init__(self, socket: str | None = None) -> None:
         self.socket = socket
-        self._path = shutil.which("tmux")
+        self._path = shutil.which("tmux", path=augmented_path())
         if self._path is None:
             raise TmuxError("tmux binary not found on PATH")
+
+    @property
+    def path(self) -> str:
+        """Absolute path to the tmux binary this wrapper drives."""
+        return self._path
 
     def _session_target(self, name: str) -> str:
         """Return an exact-match target string for a session or session:window.
@@ -226,6 +233,32 @@ class Tmux:
             args.extend(["-b", buffer_name])
         args.extend(["-t", pane])
         self._run(args)
+
+    def pipe_pane(self, pane: str, command: str) -> None:
+        """Tee everything the pane prints into ``command``'s stdin.
+
+        ``-o`` toggles, so a second identical call would stop the pipe; callers
+        should invoke this once per pane, right after it is created.
+        """
+        self._run(["pipe-pane", "-t", pane, command])
+
+    def list_clients(self) -> list[dict[str, str]]:
+        """Attached clients as {name, session}. Empty when nobody is watching."""
+        proc = self._run(
+            ["list-clients", "-F", "#{client_name} #{client_session}"], check=False
+        )
+        out: list[dict[str, str]] = []
+        for line in proc.stdout.splitlines():
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2:
+                out.append({"name": parts[0], "session": parts[1]})
+        return out
+
+    def select_window(self, target: str) -> None:
+        self._run(["select-window", "-t", target])
+
+    def switch_client(self, client: str, session: str) -> None:
+        self._run(["switch-client", "-c", client, "-t", self._session_target(session)])
 
     def kill_window(self, target: str) -> None:
         self._run(["kill-window", "-t", target])

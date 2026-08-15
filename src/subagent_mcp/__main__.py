@@ -78,6 +78,27 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     parser.add_argument(
+        "--watch-default",
+        choices=("off", "switch", "terminal"),
+        default=os.environ.get("SUBAGENT_WATCH_DEFAULT", "off"),
+        help=(
+            "Default visibility for new subagents: off (detached), switch (pull an "
+            "attached tmux client to the new window), terminal (open a terminal on it)"
+        ),
+    )
+    parser.add_argument(
+        "--terminal",
+        default=os.environ.get("SUBAGENT_TERMINAL", ""),
+        help="Terminal command template for watch=terminal, e.g. 'kitty -- bash -c {cmd}'",
+    )
+    parser.add_argument(
+        "--no-pipe-logs",
+        action="store_true",
+        default=_env_bool("SUBAGENT_NO_PIPE_LOGS", False),
+        help="Do not tee pane output into <run_dir>/output.log",
+    )
+
+    parser.add_argument(
         "--runs-keep-max",
         type=int,
         default=_env_int("SUBAGENT_RUNS_KEEP_MAX", 200),
@@ -111,6 +132,9 @@ def main(argv: list[str] | None = None) -> None:
         tmux_socket=args.tmux_socket if args.tmux_socket else None,
         cli_allowlist=tuple(a.strip() for a in args.cli_allowlist.split(",") if a.strip()),
         follow_up_settle_seconds=args.follow_up_settle,
+        watch_default=args.watch_default,
+        terminal_command=args.terminal or None,
+        pipe_logs=not args.no_pipe_logs,
         runs_keep_max=args.runs_keep_max,
         runs_max_age_days=args.runs_max_age_days,
     )

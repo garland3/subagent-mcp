@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,23 +12,34 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
+from .cli_paths import resolve_cli, searched_dirs
 from .config import ServerConfig, cwd_is_allowed, get_config
 from .runners import RunnerError, build_runner
 from .runs import (
     Run,
     choose_window_name,
     create_run_dir,
+    delete_run_dirs,
     prune_runs,
     registry as runs_registry,
     update_run_pane,
     window_base,
 )
 from .tmuxio import Tmux, TmuxError
+from .watching import (
+    WATCH_MODES,
+    WatchError,
+    attach_command,
+    open_in_terminal,
+    read_only_command,
+)
 
 
 _DEFAULT_INSTRUCTIONS = (
-    "Launch coding-CLI subagents (claude, opencode) in detached tmux windows. "
-    "Tools: launch_subagent, check_subagent, list_subagents, send_to_subagent, stop_subagent."
+    "Launch coding-CLI subagents (claude, opencode) in tmux windows — detached by "
+    "default, or visible with watch='switch'/'terminal'. Tools: launch_subagent, "
+    "check_subagent, watch_subagent, list_subagents, send_to_subagent, "
+    "stop_subagent, sweep_stale_subagents."
 )
 
 # Output snippets that indicate the subagent CLI is blocked waiting for human
@@ -64,7 +76,10 @@ def _tip(name: str) -> dict[str, Any]:
     """Build annotations hint for an MCP tool."""
     if name == "launch_subagent":
         return {"readOnlyHint": False, "openWorldHint": True}
-    destructive = name in {"stop_subagent", "send_to_subagent"}
+    if name == "watch_subagent":
+        # Not destructive, but it moves the user's terminal view / opens a window.
+        return {"readOnlyHint": False}
+    destructive = name in {"stop_subagent", "send_to_subagent", "sweep_stale_subagents"}
     return {"destructiveHint": True} if destructive else {"readOnlyHint": True}
 
 
@@ -224,9 +239,90 @@ def _parse_extra_args(extra_args: str | list[str] | None) -> list[str]:
         return [str(x) for x in extra_args]
     # Allow passing a single shell-like string. This should be rare and is only
     # a convenience; prefer a JSON list.
-    import shlex
-
     return shlex.split(extra_args)
+
+
+def _resolve_executable(cli: str) -> str:
+    """Absolute path to the CLI, or a ToolError explaining where we looked.
+
+    Failing here beats failing in the pane: a bare name that tmux cannot
+    resolve dies with an opaque ``command not found`` (exit 127) that the
+    caller only sees as a dead window.
+    """
+    path = resolve_cli(cli)
+    if path:
+        return path
+    raise ToolError(
+        f"{cli!r} was not found on PATH. Searched: {', '.join(searched_dirs())}. "
+        f"Set SUBAGENT_CLI_{cli.upper()}=/absolute/path/to/{cli} (or add its "
+        "directory to the PATH of the process running subagent-mcp)."
+    )
+
+
+def _normalize_watch(watch: str | None, cfg: ServerConfig) -> str:
+    mode = (watch or cfg.watch_default or "off").strip().lower()
+    if mode in ("none", "false", "detached"):
+        mode = "off"
+    if mode in ("attach", "client", "here"):
+        mode = "switch"
+    if mode in ("window", "term", "gui"):
+        mode = "terminal"
+    if mode not in WATCH_MODES:
+        raise ToolError(f"watch must be one of {WATCH_MODES}, got {watch!r}")
+    return mode
+
+
+def _apply_watch(tm: Tmux, cfg: ServerConfig, run: Run, mode: str) -> dict[str, Any]:
+    """Put the run on screen according to ``mode``. Never fatal to a launch."""
+    info: dict[str, Any] = {
+        "watch": mode,
+        "watch_applied": False,
+        "watch_detail": "",
+        "attach_command": attach_command(run.session, run.window, cfg.tmux_socket),
+        "attach_read_only": read_only_command(run.session, run.window, cfg.tmux_socket),
+    }
+    if mode == "off" or not run.pane_id:
+        return info
+
+    try:
+        if mode == "switch":
+            clients = tm.list_clients()
+            if not clients:
+                info["watch_detail"] = (
+                    "no tmux client is attached; run the attach_command above, "
+                    "or use watch='terminal' to open one"
+                )
+                return info
+            for client in clients:
+                tm.switch_client(client["name"], run.session)
+            tm.select_window(run.pane_id)
+            info["watch_applied"] = True
+            info["watch_detail"] = (
+                f"switched {len(clients)} attached client(s) to {run.session}:{run.window}"
+            )
+        else:  # terminal
+            info["watch_detail"] = open_in_terminal(
+                tmux_bin=tm.path,
+                socket=cfg.tmux_socket,
+                session=run.session,
+                pane_id=run.pane_id,
+                terminal_command=cfg.terminal_command,
+            )
+            info["watch_applied"] = True
+    except (TmuxError, WatchError) as exc:
+        # The subagent is running regardless; visibility is best-effort.
+        info["watch_detail"] = f"could not watch: {exc}"
+    return info
+
+
+def _start_output_log(tm: Tmux, run: Run) -> str:
+    """Tee the pane into <run_dir>/output.log so it can be tail -f'd."""
+    log_path = run.run_dir / "output.log"
+    try:
+        tm.pipe_pane(run.pane_id, f"cat >> {shlex.quote(str(log_path))}")
+    except TmuxError:
+        return ""
+    return str(log_path)
 
 
 def launch_subagent(
@@ -243,9 +339,10 @@ def launch_subagent(
     dangerous: Annotated[bool, Field(description="Skip permission prompts (--dangerously-skip-permissions / --auto)")] = True,
     extra_args: Annotated[str | list[str] | None, Field(description="Additional CLI arguments (list preferred)")] = None,
     settle_seconds: Annotated[float, Field(description="Seconds to wait before capturing initial output")] = 3.0,
+    watch: Annotated[str | None, Field(description="'off' = detached (default); 'switch' = pull an attached tmux client to this window; 'terminal' = open a terminal emulator on it")] = None,
     dry_run: Annotated[bool, Field(description="Return the generated wrapper without launching")] = False,
 ) -> str:
-    """Launch a coding-CLI subagent in a detached tmux window."""
+    """Launch a coding-CLI subagent in a tmux window (detached unless watch is set)."""
     cfg = _cfg()
     tm = _tmux(cfg)
 
@@ -261,6 +358,9 @@ def launch_subagent(
 
     if cli not in cfg.cli_allowlist:
         raise ToolError(f"cli {cli!r} is not in the allowlist: {cfg.cli_allowlist}")
+
+    watch_mode = _normalize_watch(watch, cfg)
+    executable = _resolve_executable(cli)
 
     prompt_text = _read_prompt(prompt, prompt_file)
     if not prompt_text:
@@ -304,6 +404,7 @@ def launch_subagent(
             agent=agent,
             dangerous=dangerous,
             extra_args=_parse_extra_args(extra_args),
+            executable=executable,
         )
         run.argv = runner.argv()
         run.write_meta()
@@ -319,9 +420,11 @@ def launch_subagent(
                 "run_sh": str(run_sh),
                 "command": runner.wrapper_command(),
                 "argv": run.argv,
+                "executable": executable,
                 "cwd": str(cwd_path),
                 "session": run.session,
                 "window": run.window,
+                "watch": watch_mode,
                 "dry_run": True,
             }
         )
@@ -338,6 +441,11 @@ def launch_subagent(
 
     pane_pid = tm.pane_pid(pane_id)
     update_run_pane(run, pane_id, pane_pid=pane_pid)
+
+    # Start logging before the settle wait so nothing printed during startup is
+    # lost, then put the run on screen if the caller asked to see it.
+    output_log = _start_output_log(tm, run) if cfg.pipe_logs else ""
+    watch_info = _apply_watch(tm, cfg, run, watch_mode)
 
     time.sleep(settle_seconds)
     live: set[tuple[str, int]] = set()
@@ -372,14 +480,20 @@ def launch_subagent(
             "window": run.window,
             "cwd": str(cwd_path),
             "cli": cli,
+            "executable": executable,
             "run_dir": str(run.run_dir),
+            "output_log": output_log,
             "alive": alive,
             "current_command": current_command or "",
             "initial_output": _tail(raw_output, 40),
             "blocked": blocked,
             "blocked_reason": blocked_reason or "",
             "pruned_runs": len(pruned),
-            "hint": f"tmux attach -t {run.session}:{run.window}",
+            **watch_info,
+            "hint": (
+                watch_info["attach_command"]
+                + (f"  |  tail -f {output_log}" if output_log else "")
+            ),
         }
     )
 
@@ -435,6 +549,34 @@ def check_subagent(
             "output": output,
             "blocked": blocked,
             "blocked_reason": blocked_reason or "",
+        }
+    )
+
+
+def watch_subagent(
+    handle: Annotated[str, Field(description="run_id, pane id, or sess:win target")],
+    mode: Annotated[str, Field(description="'switch' pulls an attached tmux client to this window; 'terminal' opens a terminal emulator on it; 'off' just returns the attach commands")] = "switch",
+) -> str:
+    """Put an already-running subagent on screen, or report how to attach to it."""
+    cfg = _cfg()
+    tm = _tmux(cfg)
+    run = _resolve_handle(handle, cfg)
+
+    if not run.pane_id:
+        raise ToolError(f"Run {run.run_id!r} has no pane id (dry run?)")
+
+    watch_mode = _normalize_watch(mode, cfg)
+    info = _apply_watch(tm, cfg, run, watch_mode)
+    log_path = run.run_dir / "output.log"
+
+    return _json(
+        {
+            "run_id": run.run_id,
+            "pane_id": run.pane_id,
+            "target": f"{run.session}:{run.window}",
+            "alive": _is_alive(run, _live_panes(tm)),
+            "output_log": str(log_path) if log_path.exists() else "",
+            **info,
         }
     )
 
@@ -545,6 +687,68 @@ def stop_subagent(
         )
 
 
+def sweep_stale_subagents(
+    session: Annotated[str | None, Field(description="Only clear stale runs in this tmux session (None = all sessions)")] = None,
+    dry_run: Annotated[bool, Field(description="Report what would be cleared without deleting")] = False,
+) -> str:
+    """Delete run records for subagents whose tmux panes are no longer alive.
+
+    list_subagents marks dead panes but leaves their run directories on disk;
+    this tool reaps them. Live subagents are never touched.
+    """
+    cfg = _cfg()
+    tm = _tmux(cfg)
+    reg = _load_registry(cfg)
+    live = _live_panes(tm)
+
+    stale: list[dict[str, Any]] = []
+    stale_ids: list[str] = []
+    alive_count = 0
+    for run in sorted(reg.values(), key=lambda r: r.start_time or ""):
+        if session and run.session != session:
+            continue
+        if _is_alive(run, live):
+            alive_count += 1
+            continue
+        stale_ids.append(run.run_id)
+        stale.append(
+            {
+                "run_id": run.run_id,
+                "pane_id": run.pane_id,
+                "target": f"{run.session}:{run.window}",
+                "session": run.session,
+                "window": run.window,
+                "cli": run.cli,
+                "task": run.task,
+            }
+        )
+
+    if dry_run:
+        return _json(
+            {
+                "dry_run": True,
+                "would_clear": len(stale),
+                "stale": stale,
+                "alive": alive_count,
+            }
+        )
+
+    removed = delete_run_dirs(cfg.runs_root, stale_ids)
+    removed_set = set(removed)
+    not_found = [rid for rid in stale_ids if rid not in removed_set]
+
+    return _json(
+        {
+            "dry_run": False,
+            "cleared": len(removed),
+            "cleared_runs": removed,
+            "not_found": not_found,
+            "alive": alive_count,
+            "remaining_total": len(reg) - len(removed),
+        }
+    )
+
+
 def register_tools(cfg: ServerConfig | None = None) -> None:
     """Register tools on the FastMCP instance."""
     if cfg is None:
@@ -557,7 +761,15 @@ def register_tools(cfg: ServerConfig | None = None) -> None:
         + "."
     )
 
-    for name in ("launch_subagent", "check_subagent", "list_subagents", "send_to_subagent", "stop_subagent"):
+    for name in (
+        "launch_subagent",
+        "check_subagent",
+        "watch_subagent",
+        "list_subagents",
+        "send_to_subagent",
+        "stop_subagent",
+        "sweep_stale_subagents",
+    ):
         try:
             mcp.local_provider.remove_tool(name)
         except Exception:
@@ -565,9 +777,11 @@ def register_tools(cfg: ServerConfig | None = None) -> None:
 
     mcp.tool(launch_subagent, annotations=_tip("launch_subagent"))
     mcp.tool(check_subagent, annotations=_tip("check_subagent"))
+    mcp.tool(watch_subagent, annotations=_tip("watch_subagent"))
     mcp.tool(list_subagents, annotations=_tip("list_subagents"))
     mcp.tool(send_to_subagent, annotations=_tip("send_to_subagent"))
     mcp.tool(stop_subagent, annotations=_tip("stop_subagent"))
+    mcp.tool(sweep_stale_subagents, annotations=_tip("sweep_stale_subagents"))
 
 
 register_tools()
