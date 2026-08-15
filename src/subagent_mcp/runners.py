@@ -13,18 +13,36 @@ class RunnerError(Exception):
 _POINTER = "Read the file at {path} and execute all instructions in it."
 
 # Standing instruction appended to every launch prompt (Phase 1.1). Tells the
-# agent to write a short RESULT.md before finishing. The actual file path is
+# agent to write a short result summary before finishing. The actual file path is
 # inlined so the model sees it directly, and $SUBAGENT_RESULT_FILE is exported
 # in run.sh so shell commands can reference it too.
+#
+# The instruction leads with the absolute path and states the negative
+# explicitly. An earlier wording opened with "write a short RESULT.md to
+# <path>", which invites the model to pattern-match on the bare filename and
+# create ./RESULT.md in the working directory instead -- i.e. inside the repo,
+# where `git add -A` sweeps it into a commit and (worst case) an upstream PR.
+# The run directory is outside every repo, so a correctly-followed instruction
+# cannot collide between concurrent agents or dirty a working tree.
+# `_reconcile_stray_result` in server.py recovers the case where it is ignored.
 _RESULT_INSTRUCTION = """
 
 ---
 [subagent-mcp standing instruction]
-Before finishing, write a short RESULT.md to {result_path} summarizing:
+Before finishing, write a short summary of your work to this exact absolute path:
+
+    {result_path}
+
+Write it there and nowhere else. Do NOT create a RESULT.md in the repository or
+in your working directory -- that path is outside any repo precisely so your
+summary never lands in a commit. The same path is in $SUBAGENT_RESULT_FILE.
+
+Cover:
 - What you did
 - What you verified (commands run, outputs checked)
 - What you could not do or left incomplete
 - Open questions for the operator
+
 This file is how the operator reads your work without opening tmux."""
 
 # Sentinel used while building argv so that wrapper_command can render the

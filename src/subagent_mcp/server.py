@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import time
 import uuid
@@ -179,17 +180,83 @@ _RESULT_MD_MAX_CHARS = 4000
 _RESULT_MD_MAX_LINES = 80
 
 
+def _reconcile_stray_result(run: Run) -> str | None:
+    """Recover a RESULT.md the agent wrote into its working directory.
+
+    The standing instruction gives an absolute path inside the run directory,
+    but a model that pattern-matches on the filename can write ``./RESULT.md``
+    instead -- which lands *inside the repo*, where ``git add -A`` will sweep it
+    into a commit. That is the failure this function exists to catch.
+
+    Moves the stray file into the run directory and returns the path it came
+    from, so the caller can report it. Does nothing (returns None) when the run
+    directory already holds a result: a compliant write is authoritative, and a
+    pre-existing ``RESULT.md`` in the repo may well be a legitimate project file
+    that predates this run and must not be moved.
+
+    Deliberately conservative -- this touches a file in the user's repo:
+    - Only ever the exact path ``<cwd>/RESULT.md``; never a recursive search.
+    - Never overwrites; skips when the destination exists.
+    - Skips a tracked file. ``git ls-files --error-unmatch`` returning 0 means
+      the file is committed, so it belongs to the project, not to this run.
+    - Any OSError leaves the file untouched. A failed reconcile must not fail
+      the check that called it.
+    """
+    dest = run.run_dir / "RESULT.md"
+    if dest.exists():
+        return None
+
+    stray = run.cwd / "RESULT.md"
+    try:
+        if not stray.is_file():
+            return None
+    except OSError:
+        return None
+
+    # A tracked RESULT.md is project content, not agent output. Moving it would
+    # show up as a deletion in the user's working tree -- far worse than the
+    # stray file we are trying to clean up.
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "RESULT.md"],
+            cwd=str(run.cwd),
+            capture_output=True,
+            timeout=10,
+        )
+        if tracked.returncode == 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        # Not a git repo, or git is unavailable. Falling through is safe: the
+        # move is still non-destructive because dest is known not to exist.
+        pass
+
+    # No log line here: this package writes nothing to stdout (it would corrupt
+    # the stdio MCP stream) and has no logger. The reconcile is reported through
+    # the payload instead, which is where the operator will actually see it. A
+    # failed move leaves ``result="none"`` -- already a visible state.
+    try:
+        shutil.move(str(stray), str(dest))
+    except OSError:
+        return None
+
+    return str(stray)
+
+
 def _result_payload(run: Run) -> dict[str, Any]:
     """Read RESULT.md and STATUS.json for an idle run.
 
     Returns a dict with:
     - ``result``: "present" or "none" (never silent success — §1.1/§5.2)
     - ``result_md``: content of RESULT.md, capped to keep the payload small
+    - ``result_reconciled_from``: set only when the agent wrote the file into
+      its working directory and it was moved back; surfaced so non-compliance
+      is visible rather than silently repaired
     - ``status``: parsed STATUS.json (exit code, git SHAs, changed files) or None
 
     Absence of RESULT.md is ``result="none"`` — the design (§3.4 risk 8) calls
     this out: "Make absence a visible state."
     """
+    reconciled_from = _reconcile_stray_result(run)
     result_path = run.run_dir / "RESULT.md"
     result_md = ""
     result_status = "none"
@@ -216,7 +283,14 @@ def _result_payload(run: Run) -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             status = None
 
-    return {"result": result_status, "result_md": result_md, "status": status}
+    payload: dict[str, Any] = {
+        "result": result_status,
+        "result_md": result_md,
+        "status": status,
+    }
+    if reconciled_from:
+        payload["result_reconciled_from"] = reconciled_from
+    return payload
 
 
 def _live_panes(tm: Tmux) -> set[tuple[str, int]]:
@@ -997,6 +1071,11 @@ def check_subagent(
     wrapper has written it. Absence of RESULT.md is reported as
     result="none", never silent success. While working, returns the tail of
     the pane output (box-drawing stripped, capped).
+
+    If the agent wrote its RESULT.md into the working directory instead of the
+    run directory, the file is moved back and result_reconciled_from names the
+    path it came from. That means a stray file was left inside the repo and
+    could have been committed by accident — worth mentioning to the operator.
 
     Use this instead of `tmux capture-pane` so you get the transcript-derived
     state (working|idle, not just TUI chrome) and so the run is reconciled

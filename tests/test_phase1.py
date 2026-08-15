@@ -823,3 +823,99 @@ def test_check_idle_output_empty(env):
     assert snap["output"] == ""
 
     stop_subagent(handle=out["pane_id"], kill_window=True)
+
+# ---------------------------------------------------------------------------
+# Stray RESULT.md reconcile (guards against the agent writing into the repo,
+# where `git add -A` would sweep the file into a commit)
+# ---------------------------------------------------------------------------
+
+
+def _run_in(tmp_path) -> Run:
+    """A Run whose run_dir and cwd are separate directories."""
+    run_dir = tmp_path / "rundir"
+    cwd = tmp_path / "repo"
+    run_dir.mkdir()
+    cwd.mkdir()
+    return Run(
+        run_id="r1", run_dir=run_dir, cwd=cwd, cli="claude",
+        session="s", window="w",
+    )
+
+
+def test_stray_result_is_moved_into_run_dir(tmp_path):
+    """A RESULT.md written into cwd is moved to the run dir and reported."""
+    run = _run_in(tmp_path)
+    stray = run.cwd / "RESULT.md"
+    stray.write_text("wrote it in the repo by mistake", encoding="utf-8")
+
+    payload = _result_payload(run)
+
+    assert payload["result"] == "present"
+    assert "mistake" in payload["result_md"]
+    # The file must no longer be sitting in the repo, where it could be committed.
+    assert not stray.exists()
+    assert (run.run_dir / "RESULT.md").is_file()
+    assert payload["result_reconciled_from"] == str(stray)
+
+
+def test_compliant_result_wins_over_stray(tmp_path):
+    """A correct write is authoritative; a same-named file in cwd is left alone."""
+    run = _run_in(tmp_path)
+    _write_result_md(run, "the real result")
+    stray = run.cwd / "RESULT.md"
+    stray.write_text("unrelated project file", encoding="utf-8")
+
+    payload = _result_payload(run)
+
+    assert payload["result_md"] == "the real result"
+    assert "result_reconciled_from" not in payload
+    # Untouched: this may be a legitimate file that predates the run.
+    assert stray.read_text(encoding="utf-8") == "unrelated project file"
+
+
+def test_no_stray_no_reconcile_key(tmp_path):
+    """The reconcile key is absent on the normal path."""
+    run = _run_in(tmp_path)
+    _write_result_md(run, "fine")
+    payload = _result_payload(run)
+    assert "result_reconciled_from" not in payload
+
+
+def test_missing_result_still_reports_none(tmp_path):
+    """No result anywhere stays a visible 'none', not an error."""
+    run = _run_in(tmp_path)
+    payload = _result_payload(run)
+    assert payload["result"] == "none"
+    assert "result_reconciled_from" not in payload
+
+
+def test_tracked_result_md_is_not_moved(tmp_path):
+    """A committed RESULT.md is project content and must not be moved."""
+    import subprocess
+
+    run = _run_in(tmp_path)
+    tracked = run.cwd / "RESULT.md"
+    tracked.write_text("# Project results\n", encoding="utf-8")
+    for cmd in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", "RESULT.md"],
+        ["git", "commit", "-qm", "add results"],
+    ):
+        subprocess.run(cmd, cwd=str(run.cwd), check=True, capture_output=True)
+
+    payload = _result_payload(run)
+
+    assert tracked.is_file(), "a tracked file must never be moved out of the repo"
+    assert payload["result"] == "none"
+    assert "result_reconciled_from" not in payload
+
+
+def test_reconcile_ignores_directory_named_result_md(tmp_path):
+    """A directory named RESULT.md is not a stray file; leave it."""
+    run = _run_in(tmp_path)
+    (run.cwd / "RESULT.md").mkdir()
+    payload = _result_payload(run)
+    assert payload["result"] == "none"
+    assert (run.cwd / "RESULT.md").is_dir()
