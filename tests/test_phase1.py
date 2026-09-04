@@ -10,6 +10,7 @@ synthetic RESULT.md / sentinel files written into the run dir.
 import json
 import stat
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -831,7 +832,14 @@ def test_check_idle_output_empty(env):
 
 
 def _run_in(tmp_path) -> Run:
-    """A Run whose run_dir and cwd are separate directories."""
+    """A Run whose run_dir and cwd are separate directories.
+
+    ``start_time`` is set because ``create_run_dir`` always sets it, and
+    reconciliation now needs a provenance window: without a start it cannot
+    tell this run's output from a file written long before the run existed,
+    so it declines rather than guessing. A Run without one is not a shape the
+    real code produces.
+    """
     run_dir = tmp_path / "rundir"
     cwd = tmp_path / "repo"
     run_dir.mkdir()
@@ -839,6 +847,7 @@ def _run_in(tmp_path) -> Run:
     return Run(
         run_id="r1", run_dir=run_dir, cwd=cwd, cli="claude",
         session="s", window="w",
+        start_time=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
     )
 
 

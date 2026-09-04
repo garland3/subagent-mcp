@@ -182,6 +182,60 @@ _RESULT_MD_MAX_CHARS = 4000
 _RESULT_MD_MAX_LINES = 80
 
 
+def _invocation_window(run: Run) -> tuple[datetime | None, datetime | None]:
+    """(start, end) of the run's most recent invocation; end None = still going.
+
+    Both halves must come from the same invocation. A resumed run keeps its
+    original ``start_time`` on the record while its STATUS.json describes the
+    latest resume -- pairing those two spans the idle gap between them, and
+    anything written during that gap would look like it happened while the run
+    was active. So when STATUS.json carries its own ``started_at``, that pair
+    wins; the record's ``start_time`` is only the fallback for a run that has
+    not produced a status yet (which is also the case where the run is still
+    going, hence an open-ended window).
+    """
+
+    def _parse(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    status_path = run.run_dir / "STATUS.json"
+    recorded: dict[str, Any] = {}
+    status_mtime: datetime | None = None
+    try:
+        if status_path.is_file():
+            status_mtime = datetime.fromtimestamp(
+                status_path.stat().st_mtime, tz=timezone.utc
+            )
+            try:
+                loaded = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    recorded = loaded
+            except (json.JSONDecodeError, OSError, ValueError):
+                recorded = {}
+    except OSError:
+        status_mtime = None
+
+    if status_mtime is not None:
+        # The wrapper writes both halves; ended_at falls back to the file's
+        # own mtime, which is when it was written.
+        started = _parse(recorded.get("started_at"))
+        ended = _parse(recorded.get("ended_at")) or status_mtime
+        if started is not None:
+            return started, ended
+        # A status without a usable started_at cannot define a window on its
+        # own; fall through to the record's start, keeping this end.
+        return _parse(run.start_time), ended
+
+    # No status yet: the run has not finished, so the window is open-ended.
+    return _parse(run.start_time), None
+
+
 def _reconcile_stray_result(run: Run) -> str | None:
     """Recover a RESULT.md the agent wrote into its working directory.
 
@@ -218,65 +272,43 @@ def _reconcile_stray_result(run: Run) -> str | None:
     # Provenance, not just untrackedness. An untracked RESULT.md that predates
     # the run cannot be this run's output -- it is someone's local scratch file,
     # and moving it would silently remove it from their working tree (and let a
-    # later sweep_stale_subagents delete it for good). Requiring the mtime to be
-    # at or after the run's start also stops two concurrent runs sharing a cwd
-    # from claiming each other's file: at most the one that started before it
-    # was written can, which is the best `git ls-files` plus mtime can prove.
+    # later sweep_stale_subagents delete it for good).
+    #
+    # The window has to come from ONE invocation. A resumed run's
+    # ``start_time`` describes the original launch while its STATUS.json
+    # describes the latest resume, so pairing them spans the idle gap in
+    # between -- and a file someone wrote during that gap would look like this
+    # run's output. ``_invocation_window`` keeps the halves together.
     try:
         stray_mtime = datetime.fromtimestamp(stray.stat().st_mtime, tz=timezone.utc)
-        started = datetime.fromisoformat(run.start_time) if run.start_time else None
-    except (OSError, ValueError):
-        return None
-    if started is not None:
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        # One second of slack: filesystem mtimes and our ISO timestamp are not
-        # sampled from the same clock read.
-        if stray_mtime < started - timedelta(seconds=1):
-            return None
-
-    # ...and an upper bound too. The start check alone only says the file is
-    # not older than the run. If the run finished without writing a summary and
-    # an unrelated untracked RESULT.md appears afterwards -- before anyone calls
-    # check_subagent -- its mtime still clears the start bound and it would be
-    # adopted, then deleted by a later sweep. A file created after this run
-    # exited cannot be that run's output. STATUS.json is when the wrapper
-    # recorded the exit; prefer its ended_at, fall back to its mtime.
-    status_path = run.run_dir / "STATUS.json"
-    ended: datetime | None = None
-    try:
-        if status_path.is_file():
-            try:
-                recorded = json.loads(status_path.read_text(encoding="utf-8"))
-                raw = recorded.get("ended_at") or ""
-                if raw:
-                    ended = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except (json.JSONDecodeError, OSError, ValueError, AttributeError):
-                ended = None
-            if ended is None:
-                ended = datetime.fromtimestamp(
-                    status_path.stat().st_mtime, tz=timezone.utc
-                )
     except OSError:
-        ended = None
-    if ended is not None:
-        if ended.tzinfo is None:
-            ended = ended.replace(tzinfo=timezone.utc)
-        # A few seconds of slack: the agent writes its file, then the CLI exits
-        # and the wrapper stamps STATUS.json, so the legitimate ordering has
-        # the stray file just *before* the end -- but clock granularity and a
-        # slow exit can invert it by a hair.
-        if stray_mtime > ended + timedelta(seconds=5):
-            return None
+        return None
 
-    # Ambiguity means hands off. mtime rules out files older than this run, but
-    # it cannot tell two *overlapping* runs in the same cwd apart: if A and B
-    # both started before B wrote the file, its mtime is newer than both, and
-    # reconciling A first would move B's result under A's name -- where a later
-    # sweep of A deletes it. There is no run-specific marker on a stray file to
+    started, ended = _invocation_window(run)
+    if started is None:
+        return None
+    # A second of slack below, five above: filesystem mtimes and our ISO
+    # timestamps are not sampled from the same clock read, and the legitimate
+    # ordering at the end is "agent writes the file, CLI exits, wrapper stamps
+    # STATUS.json", which a slow exit can invert by a hair.
+    if stray_mtime < started - timedelta(seconds=1):
+        return None
+    if ended is not None and stray_mtime > ended + timedelta(seconds=5):
+        return None
+
+    # Ambiguity means hands off. The window above says the file appeared while
+    # this run was active; it cannot say no *other* run was active too. Two
+    # overlapping runs in one cwd both contain the mtime, so reconciling the
+    # first would move the second's result under the wrong name -- where a
+    # later sweep deletes it. A stray file carries no run-specific marker to
     # break the tie (the whole point of this path is that the agent ignored
     # $SUBAGENT_RESULT_FILE, which is the marker), so when more than one run
     # could plausibly have written it, no one claims it.
+    #
+    # A fresh scan, deliberately. It looks like a per-check cost but is not:
+    # the `stray.is_file()` gate above returns first in the overwhelmingly
+    # common case where the agent complied and no stray file exists, so this
+    # only runs when there is actually something to reconcile.
     try:
         others = [
             other
@@ -286,36 +318,15 @@ def _reconcile_stray_result(run: Run) -> str | None:
     except Exception:
         others = []
     for other in others:
-        if not other.start_time:
-            # Unknown start: cannot rule it out, so it counts as a rival.
+        other_started, other_ended = _invocation_window(other)
+        if other_started is None:
+            # Unknown window: cannot rule it out, so it counts as a rival.
             return None
-        try:
-            other_started = datetime.fromisoformat(other.start_time)
-        except ValueError:
-            return None
-        if other_started.tzinfo is None:
-            other_started = other_started.replace(tzinfo=timezone.utc)
         if other_started > stray_mtime + timedelta(seconds=1):
-            # Started after the file existed: cannot have written it.
-            continue
-        # It started early enough -- but had it already finished? A run that
-        # exited before the file appeared is not a rival either, and this is
-        # the common case: run dirs are kept (up to runs_keep_max) and people
-        # launch into the same repo over and over, so without this check a
-        # single old record would disable reconciliation for that cwd forever.
-        # STATUS.json's mtime is when the wrapper recorded that run's exit.
-        other_status = other.run_dir / "STATUS.json"
-        try:
-            if other_status.is_file():
-                other_ended = datetime.fromtimestamp(
-                    other_status.stat().st_mtime, tz=timezone.utc
-                )
-                if other_ended < stray_mtime - timedelta(seconds=1):
-                    continue
-        except OSError:
-            pass
-        # Started before, and no evidence it had finished: just as plausible
-        # an author as ours.
+            continue  # started after the file existed; cannot have written it
+        if other_ended is not None and other_ended < stray_mtime - timedelta(seconds=5):
+            continue  # already exited when the file appeared
+        # Active when the file appeared: just as plausible an author as ours.
         return None
 
     # A tracked RESULT.md is project content, not agent output. Moving it would

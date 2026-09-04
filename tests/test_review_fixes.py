@@ -337,3 +337,108 @@ def test_file_created_after_the_run_exited_is_not_adopted(tmp_path, env):
     within = time.time() - 3600 - 60
     os.utime(stray, (within, within))
     assert _reconcile_stray_result(run) == str(stray)
+
+
+def _mk_run(cfg, work, task: str) -> Run:
+    from subagent_mcp.runs import create_run_dir
+
+    return create_run_dir(
+        cfg.runs_root,
+        session="s",
+        window=task,
+        cwd=work,
+        cli="claude",
+        model=None,
+        agent=None,
+        task=task,
+        argv=[],
+    )
+
+
+def _status(run: Run, started: datetime, ended: datetime) -> None:
+    (run.run_dir / "STATUS.json").write_text(
+        json.dumps(
+            {
+                "exit_code": 0,
+                "started_at": started.isoformat(),
+                "ended_at": ended.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_resume_gap_is_not_part_of_the_runs_window(tmp_path, env):
+    """A resumed run's window must come from one invocation, not two.
+
+    `run.start_time` describes the original launch; STATUS.json describes the
+    latest resume. Pairing them spans the idle gap in between, so a file some-
+    one wrote during that gap would look like this run's output and be adopted
+    (then deleted by a later sweep).
+    """
+    import os
+
+    cfg = env["cfg"]
+    set_config(cfg)
+    work = tmp_path / "resumed"
+    work.mkdir()
+    run = _mk_run(cfg, work, "resumed")
+
+    now = datetime.now(timezone.utc)
+    # Launched at T-4h; resumed at T-1h and finished at T-30m.
+    run.start_time = (now - timedelta(hours=4)).isoformat()
+    run.write_meta()
+    _status(run, now - timedelta(hours=1), now - timedelta(minutes=30))
+
+    # Someone wrote this during the idle gap, two hours in — inside
+    # [original start, latest end] but outside the actual resume.
+    stray = work / "RESULT.md"
+    stray.write_text("not the agent's", encoding="utf-8")
+    gap = (now - timedelta(hours=2)).timestamp()
+    os.utime(stray, (gap, gap))
+
+    assert _reconcile_stray_result(run) is None
+    assert stray.is_file()
+
+    # Written during the resume itself, it is reconciled.
+    during = (now - timedelta(minutes=45)).timestamp()
+    os.utime(stray, (during, during))
+    assert _reconcile_stray_result(run) == str(stray)
+
+
+def test_rival_resumed_after_the_file_appeared_is_not_a_rival(tmp_path, env):
+    """A rival's window must be coherent too.
+
+    An older run that had finished, then was resumed *after* the candidate
+    wrote its file, must not read as continuously active across that gap —
+    otherwise the candidate declines even though it was the only run going
+    when the file appeared.
+    """
+    import os
+
+    cfg = env["cfg"]
+    set_config(cfg)
+    work = tmp_path / "rivalgap"
+    work.mkdir()
+    rival = _mk_run(cfg, work, "rival")
+    mine = _mk_run(cfg, work, "mine")
+
+    now = datetime.now(timezone.utc)
+    # The rival ran long ago, then was resumed five minutes ago.
+    rival.start_time = (now - timedelta(hours=6)).isoformat()
+    rival.write_meta()
+    _status(rival, now - timedelta(minutes=5), now - timedelta(minutes=1))
+
+    # Mine ran in between and wrote its file an hour ago.
+    mine.start_time = (now - timedelta(hours=2)).isoformat()
+    mine.write_meta()
+    _status(mine, now - timedelta(hours=2), now - timedelta(minutes=50))
+
+    stray = work / "RESULT.md"
+    stray.write_text("mine", encoding="utf-8")
+    when = (now - timedelta(hours=1)).timestamp()
+    os.utime(stray, (when, when))
+
+    # The rival's *current* invocation began after the file existed, so it is
+    # not a rival and reconciliation proceeds.
+    assert _reconcile_stray_result(mine) == str(stray)
