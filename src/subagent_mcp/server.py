@@ -261,10 +261,28 @@ def _reconcile_stray_result(run: Run) -> str | None:
             return None
         if other_started.tzinfo is None:
             other_started = other_started.replace(tzinfo=timezone.utc)
-        if other_started <= stray_mtime + timedelta(seconds=1):
-            # That run was already going when this file appeared, so it is just
-            # as plausible an author as ours.
-            return None
+        if other_started > stray_mtime + timedelta(seconds=1):
+            # Started after the file existed: cannot have written it.
+            continue
+        # It started early enough -- but had it already finished? A run that
+        # exited before the file appeared is not a rival either, and this is
+        # the common case: run dirs are kept (up to runs_keep_max) and people
+        # launch into the same repo over and over, so without this check a
+        # single old record would disable reconciliation for that cwd forever.
+        # STATUS.json's mtime is when the wrapper recorded that run's exit.
+        other_status = other.run_dir / "STATUS.json"
+        try:
+            if other_status.is_file():
+                other_ended = datetime.fromtimestamp(
+                    other_status.stat().st_mtime, tz=timezone.utc
+                )
+                if other_ended < stray_mtime - timedelta(seconds=1):
+                    continue
+        except OSError:
+            pass
+        # Started before, and no evidence it had finished: just as plausible
+        # an author as ours.
+        return None
 
     # A tracked RESULT.md is project content, not agent output. Moving it would
     # show up as a deletion in the user's working tree -- far worse than the

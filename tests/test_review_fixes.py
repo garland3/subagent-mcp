@@ -234,3 +234,55 @@ def test_rejected_cli_args_leave_no_phantom_run(env):
     after = json.loads(list_subagents())["subagents"]
     assert len(after) == before
     assert not any(s.get("task") == "nope" for s in after)
+
+
+def test_finished_earlier_run_is_not_a_rival(tmp_path, env):
+    """Declining on ambiguity must not become declining on everything.
+
+    Run dirs are kept (up to runs_keep_max) and people launch into the same
+    repo repeatedly, so "any other run that started before this file" would
+    match some months-old record and disable reconciliation for that cwd
+    forever -- trading a rare misattribution for a permanent loss of the
+    feature. A run that had already exited when the file appeared is not a
+    rival, and STATUS.json's mtime is when the wrapper recorded that exit.
+    """
+    import os
+
+    from subagent_mcp.runs import create_run_dir
+
+    cfg = env["cfg"]
+    set_config(cfg)
+    work = tmp_path / "shared2"
+    work.mkdir()
+
+    def _mk(task: str) -> Run:
+        return create_run_dir(
+            cfg.runs_root,
+            session="s",
+            window=task,
+            cwd=work,
+            cli="claude",
+            model=None,
+            agent=None,
+            task=task,
+            argv=[],
+        )
+
+    earlier = _mk("earlier")
+    mine = _mk("mine")
+
+    # The earlier run exited an hour ago: its wrapper wrote STATUS.json then.
+    status = earlier.run_dir / "STATUS.json"
+    status.write_text('{"exit_code": 0}', encoding="utf-8")
+    long_ago = time.time() - 3600
+    os.utime(status, (long_ago, long_ago))
+
+    stray = work / "RESULT.md"
+    stray.write_text("mine, written just now", encoding="utf-8")
+
+    # It started before the file appeared, but it was already gone, so it is
+    # not a rival and reconciliation proceeds.
+    assert _reconcile_stray_result(mine) == str(stray)
+    assert (mine.run_dir / "RESULT.md").read_text(encoding="utf-8") == (
+        "mine, written just now"
+    )
