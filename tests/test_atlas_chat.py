@@ -242,3 +242,64 @@ def test_dash_leading_prompt_survives_option_parsing(tmp_path):
     # Everything after "--" is positional, so the prompt cannot be mistaken
     # for an option however it starts.
     assert argv.index("--") == len(argv) - 2
+
+
+# --------------------------------------------------------------------------
+# Completion artifacts for a one-shot CLI (PR #1 review, codex P2)
+# --------------------------------------------------------------------------
+
+
+def test_status_json_makes_a_transcriptless_run_idle(env, tmp_path):
+    """A one-shot run must become idle so its RESULT.md is actually reachable.
+
+    check_subagent only returns RESULT.md/STATUS.json when state == "idle".
+    atlas-chat has no transcript, so without this the advertised completion
+    path would never fire for it. STATUS.json is the evidence: run.sh writes
+    it only after the CLI exits, so its existence *is* completion.
+    """
+    from subagent_mcp.server import _state_for
+
+    run_dir = tmp_path / "rd"
+    run_dir.mkdir()
+    run = Run(
+        run_id="rid",
+        run_dir=run_dir,
+        cwd=tmp_path,
+        cli="atlas-chat",
+        session="s",
+        window="w",
+    )
+    # No STATUS.json yet: still unknown, not idle.
+    assert _state_for(run, env["cfg"])[0] == ""
+
+    (run_dir / "STATUS.json").write_text('{"exit_code": 0}', encoding="utf-8")
+    state, last_activity = _state_for(run, env["cfg"])
+    assert state == "idle"
+    assert last_activity  # the STATUS.json mtime, so "when" is answerable
+
+
+def test_status_json_does_not_override_a_live_transcript(env, tmp_path):
+    """The STATUS.json rung sits *below* the transcript, not above it.
+
+    A claude run whose transcript says "working" must not be declared idle
+    just because a STATUS.json from an earlier resume is lying around.
+    """
+    import subagent_mcp.server as server
+
+    run_dir = tmp_path / "rd2"
+    run_dir.mkdir()
+    (run_dir / "STATUS.json").write_text("{}", encoding="utf-8")
+    run = Run(
+        run_id="rid2",
+        run_dir=run_dir,
+        cwd=tmp_path,
+        cli="claude",
+        session="s",
+        window="w",
+    )
+    orig = server.derive_state
+    server.derive_state = lambda *a, **k: ("working", "2026-01-01T00:00:00Z")
+    try:
+        assert server._state_for(run, env["cfg"])[0] == "working"
+    finally:
+        server.derive_state = orig

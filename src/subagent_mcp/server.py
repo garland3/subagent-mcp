@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -215,6 +215,26 @@ def _reconcile_stray_result(run: Run) -> str | None:
     except OSError:
         return None
 
+    # Provenance, not just untrackedness. An untracked RESULT.md that predates
+    # the run cannot be this run's output -- it is someone's local scratch file,
+    # and moving it would silently remove it from their working tree (and let a
+    # later sweep_stale_subagents delete it for good). Requiring the mtime to be
+    # at or after the run's start also stops two concurrent runs sharing a cwd
+    # from claiming each other's file: at most the one that started before it
+    # was written can, which is the best `git ls-files` plus mtime can prove.
+    try:
+        stray_mtime = datetime.fromtimestamp(stray.stat().st_mtime, tz=timezone.utc)
+        started = datetime.fromisoformat(run.start_time) if run.start_time else None
+    except (OSError, ValueError):
+        return None
+    if started is not None:
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        # One second of slack: filesystem mtimes and our ISO timestamp are not
+        # sampled from the same clock read.
+        if stray_mtime < started - timedelta(seconds=1):
+            return None
+
     # A tracked RESULT.md is project content, not agent output. Moving it would
     # show up as a deletion in the user's working tree -- far worse than the
     # stray file we are trying to clean up.
@@ -371,7 +391,11 @@ def _looks_like_cli(args: str, cli: str) -> bool:
     return False
 
 
-def _agent_pids(pane_pid: int | None, cli: str) -> list[int] | None:
+def _agent_pids(
+    pane_pid: int | None,
+    cli: str,
+    snapshot: list[tuple[int, int, str]] | None = None,
+) -> list[int] | None:
     """PIDs of ``cli`` processes inside the pane's process subtree.
 
     None means "could not tell" (no ps, or no recorded pane pid) — callers
@@ -380,7 +404,12 @@ def _agent_pids(pane_pid: int | None, cli: str) -> list[int] | None:
     """
     if pane_pid is None:
         return None
-    snapshot = _ps_snapshot()
+    # Callers listing many runs pass one snapshot in rather than forking a
+    # `ps` per run -- an N-run listing was N `ps` invocations. Anything that
+    # acts and then re-checks (the stop ladder) must keep passing None so it
+    # re-reads, or it would verify a kill against a pre-kill snapshot.
+    if snapshot is None:
+        snapshot = _ps_snapshot()
     if snapshot is None:
         return None
     children: dict[int, list[int]] = {}
@@ -402,7 +431,11 @@ def _agent_pids(pane_pid: int | None, cli: str) -> list[int] | None:
     return found
 
 
-def _agent_running(run: Run, live: set[tuple[str, int]]) -> bool:
+def _agent_running(
+    run: Run,
+    live: set[tuple[str, int]],
+    snapshot: list[tuple[int, int, str]] | None = None,
+) -> bool:
     """True when the run's CLI process is still running in its pane.
 
     This — not pane existence — is what "alive" means to a caller asking
@@ -410,7 +443,7 @@ def _agent_running(run: Run, live: set[tuple[str, int]]) -> bool:
     """
     if not _is_alive(run, live):
         return False
-    pids = _agent_pids(run.pane_pid, run.cli)
+    pids = _agent_pids(run.pane_pid, run.cli, snapshot)
     if pids is None:
         # No evidence either way: fall back to pane liveness rather than
         # declaring a possibly-working agent finished.
@@ -418,11 +451,15 @@ def _agent_running(run: Run, live: set[tuple[str, int]]) -> bool:
     return bool(pids)
 
 
-def _liveness(run: Run, live: set[tuple[str, int]]) -> str:
+def _liveness(
+    run: Run,
+    live: set[tuple[str, int]],
+    snapshot: list[tuple[int, int, str]] | None = None,
+) -> str:
     """'running' (agent alive) | 'exited' (pane open, agent gone) | 'gone' (no pane)."""
     if not _is_alive(run, live):
         return "gone"
-    return "running" if _agent_running(run, live) else "exited"
+    return "running" if _agent_running(run, live, snapshot) else "exited"
 
 
 def _active_count(tm: Tmux, cfg: ServerConfig | None = None) -> int:
@@ -431,7 +468,8 @@ def _active_count(tm: Tmux, cfg: ServerConfig | None = None) -> int:
     live = _live_panes(tm)
     # Concurrency is about agents doing work, not panes sitting at a shell
     # prompt after their agent exited — those must not consume slots.
-    return sum(1 for run in reg.values() if _agent_running(run, live))
+    snapshot = _ps_snapshot()
+    return sum(1 for run in reg.values() if _agent_running(run, live, snapshot))
 
 
 def _state_for(run: Run, cfg: ServerConfig) -> tuple[str, str]:
@@ -448,11 +486,32 @@ def _state_for(run: Run, cfg: ServerConfig) -> tuple[str, str]:
     override, sentinel_activity = _check_stop_sentinel(run)
     if override:
         return override, sentinel_activity
-    return derive_state(
+    state, last_activity = derive_state(
         run,
         claude_projects_root=cfg.claude_projects_root,
         opencode_state_root=cfg.opencode_state_root,
     )
+    if state:
+        return state, last_activity
+    # No transcript to read. For a one-shot CLI like atlas-chat there never
+    # will be one, so "unknown" would be permanent -- and check_subagent only
+    # returns RESULT.md/STATUS.json for an *idle* run, meaning the advertised
+    # completion path would never fire for it.
+    #
+    # STATUS.json is the evidence that closes the gap: run.sh writes it only
+    # after the CLI has exited, so its existence *is* completion. Rung 3 of
+    # the ladder, below the Stop-hook sentinel and the transcript, and used
+    # only when both are silent -- so this never overrides a live claude run.
+    status_path = run.run_dir / "STATUS.json"
+    try:
+        if status_path.is_file():
+            mtime = datetime.fromtimestamp(
+                status_path.stat().st_mtime, tz=timezone.utc
+            )
+            return "idle", mtime.isoformat()
+    except OSError:
+        pass
+    return "", last_activity
 
 
 # ---------------------------------------------------------------------------
@@ -1146,7 +1205,11 @@ def launch_subagent(
     try:
         raw_output = tm.capture_pane(pane_id, lines=100)
         live = _live_panes(tm)
-        alive = _is_alive(run, live)
+        # Agent liveness, not pane existence: a one-shot CLI (atlas-chat) can
+        # finish inside settle_seconds, leaving run.sh parked at its shell. The
+        # pane is alive; the agent is not. Reporting pane liveness here made
+        # launch say alive=true while an immediate check_subagent said false.
+        alive = _agent_running(run, live)
         current_command = tm.pane_command(pane_id)
     except TmuxError:
         raw_output = ""
@@ -1389,12 +1452,16 @@ def list_subagents(
     # One tmux round-trip for the whole listing; _is_alive handles both the
     # pid-verified and the legacy pane-id-only cases from this single snapshot.
     live = _live_panes(tm)
+    # ...and one `ps` for the whole listing, for the same reason: liveness is
+    # per-run but the process table is not, and forking a `ps` per run made a
+    # listing O(N) subprocesses.
+    ps = _ps_snapshot()
     items: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
     for run in sorted(reg.values(), key=lambda r: r.start_time or ""):
         if session and run.session != session:
             continue
-        pane_state = _liveness(run, live)
+        pane_state = _liveness(run, live, ps)
         alive = pane_state == "running"
         age = ""
         if run.start_time:
@@ -1642,6 +1709,7 @@ def stop_subagent(
         snapshot.update(
             {
                 "stopped": True,
+                "verified": True,
                 "method": "already_exited",
                 "attempts": [],
                 "pane_closed": pane_closed,
@@ -1680,7 +1748,11 @@ def stop_subagent(
             snapshot = json.loads(_dead_snapshot(reconciled=False))
         snapshot.update(
             {
-                "stopped": "unverified",
+                # `stopped` stays strictly boolean so callers can trust the
+                # type; the uncertainty rides in `verified` instead of
+                # overloading the same field with a string.
+                "stopped": False,
+                "verified": False,
                 "method": "ctrl-c",
                 "note": "Sent Ctrl-C but could not verify the process stopped "
                 f"(no process snapshot for pane pid {run.pane_pid!r}). One "
@@ -1734,6 +1806,7 @@ def stop_subagent(
         snapshot.update(
             {
                 "stopped": True,
+                "verified": True,
                 "method": method,
                 "attempts": attempts,
                 "pane_closed": True,
@@ -1770,6 +1843,7 @@ def stop_subagent(
     snapshot.update(
         {
             "stopped": stopped,
+            "verified": True,
             "method": method,
             "attempts": attempts,
             "pane_closed": pane_closed,
