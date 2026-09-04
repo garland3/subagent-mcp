@@ -261,6 +261,12 @@ class CLIRunner:
             f"export SUBAGENT_RUN_ID={shlex.quote(run_id)}\n"
             f"export SUBAGENT_STATUS_FILE={shlex.quote(str(status_path))}\n"
             f"{self._cli_env_exports()}"
+            f"# STATUS.json means 'the CLI tracked by this run dir has exited'.\n"
+            f"# A resume reuses the run dir, so a stale one from the previous\n"
+            f"# turn would otherwise sit here claiming this turn is finished --\n"
+            f"# and _state_for reads its presence as completion. Clear it first\n"
+            f"# so the file only ever describes the run now starting.\n"
+            f"rm -f {shlex.quote(str(status_path))}\n"
             f"cd {shlex.quote(str(cwd))} || exit 1\n"
             f"# Phase 1.3: capture git state before the agent runs.\n"
             f"git_sha_before=$(git rev-parse HEAD 2>/dev/null || echo \"\")\n"
@@ -339,3 +345,25 @@ def build_runner(
         executable=executable,
         session_id=session_id,
     )
+
+
+def validate_cli_args(
+    cli: str,
+    *,
+    agent: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Reject arguments a CLI cannot express, before anything is created.
+
+    ``CLIRunner.__init__`` enforces the same rules, but by then the caller has
+    already made a run directory, written meta.json, and registered the run --
+    so raising there leaves a phantom dead run behind for listing and
+    retention tools to trip over. Callers validate up front with this; the
+    constructor keeps its own check as the backstop for direct construction.
+    """
+    if agent and cli in CLIRunner._NO_AGENT_CLIs:
+        raise RunnerError(f"{cli} has no --agent equivalent; drop the agent argument")
+    if session_id and cli in CLIRunner._NO_SESSION_CLIs:
+        raise RunnerError(
+            f"{cli} has no conversation id to pre-assign; leave session_id unset"
+        )

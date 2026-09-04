@@ -17,7 +17,7 @@ from pydantic import Field
 
 from .cli_paths import augmented_path, resolve_cli, searched_dirs
 from .config import ServerConfig, cwd_is_allowed, get_config
-from .runners import RunnerError, build_runner
+from .runners import RunnerError, build_runner, validate_cli_args
 from .runs import (
     Run,
     choose_window_name,
@@ -233,6 +233,37 @@ def _reconcile_stray_result(run: Run) -> str | None:
         # One second of slack: filesystem mtimes and our ISO timestamp are not
         # sampled from the same clock read.
         if stray_mtime < started - timedelta(seconds=1):
+            return None
+
+    # Ambiguity means hands off. mtime rules out files older than this run, but
+    # it cannot tell two *overlapping* runs in the same cwd apart: if A and B
+    # both started before B wrote the file, its mtime is newer than both, and
+    # reconciling A first would move B's result under A's name -- where a later
+    # sweep of A deletes it. There is no run-specific marker on a stray file to
+    # break the tie (the whole point of this path is that the agent ignored
+    # $SUBAGENT_RESULT_FILE, which is the marker), so when more than one run
+    # could plausibly have written it, no one claims it.
+    try:
+        others = [
+            other
+            for other in _load_registry().values()
+            if other.run_id != run.run_id and other.cwd == run.cwd
+        ]
+    except Exception:
+        others = []
+    for other in others:
+        if not other.start_time:
+            # Unknown start: cannot rule it out, so it counts as a rival.
+            return None
+        try:
+            other_started = datetime.fromisoformat(other.start_time)
+        except ValueError:
+            return None
+        if other_started.tzinfo is None:
+            other_started = other_started.replace(tzinfo=timezone.utc)
+        if other_started <= stray_mtime + timedelta(seconds=1):
+            # That run was already going when this file appeared, so it is just
+            # as plausible an author as ours.
             return None
 
     # A tracked RESULT.md is project content, not agent output. Moving it would
@@ -1079,6 +1110,15 @@ def launch_subagent(
 
     if prompt_mode not in ("inline", "pointer"):
         raise ToolError("prompt_mode must be 'inline' or 'pointer'")
+
+    # Reject arguments this CLI cannot express *before* create_run_dir writes
+    # a run directory and registers the run. Raising after that point left a
+    # phantom dead run behind for list_subagents and the retention sweep to
+    # trip over, for a launch that never happened.
+    try:
+        validate_cli_args(cli, agent=agent)
+    except RunnerError as exc:
+        raise ToolError(str(exc)) from exc
 
     # Mint the CLI conversation id up front when the CLI supports it. claude
     # takes --session-id <uuid>; opencode has no pre-assign flag and the id is
@@ -2058,6 +2098,10 @@ def resume_subagent(
         f"export SUBAGENT_RESULT_FILE={shlex.quote(str(result_path))}\n"
         f"export SUBAGENT_RUN_ID={shlex.quote(run.run_id)}\n"
         f"export SUBAGENT_STATUS_FILE={shlex.quote(str(status_path))}\n"
+        f"# A resume reuses the run dir, so the previous turn's STATUS.json is\n"
+        f"# sitting right here. _state_for reads its presence as 'the CLI has\n"
+        f"# exited', which would make this turn look finished before it began.\n"
+        f"rm -f {shlex.quote(str(status_path))}\n"
         f"cd {shlex.quote(str(run.cwd))} || exit 1\n"
         f"git_sha_before=$(git rev-parse HEAD 2>/dev/null || echo \"\")\n"
         f"started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
