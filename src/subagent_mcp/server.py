@@ -235,6 +235,40 @@ def _reconcile_stray_result(run: Run) -> str | None:
         if stray_mtime < started - timedelta(seconds=1):
             return None
 
+    # ...and an upper bound too. The start check alone only says the file is
+    # not older than the run. If the run finished without writing a summary and
+    # an unrelated untracked RESULT.md appears afterwards -- before anyone calls
+    # check_subagent -- its mtime still clears the start bound and it would be
+    # adopted, then deleted by a later sweep. A file created after this run
+    # exited cannot be that run's output. STATUS.json is when the wrapper
+    # recorded the exit; prefer its ended_at, fall back to its mtime.
+    status_path = run.run_dir / "STATUS.json"
+    ended: datetime | None = None
+    try:
+        if status_path.is_file():
+            try:
+                recorded = json.loads(status_path.read_text(encoding="utf-8"))
+                raw = recorded.get("ended_at") or ""
+                if raw:
+                    ended = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except (json.JSONDecodeError, OSError, ValueError, AttributeError):
+                ended = None
+            if ended is None:
+                ended = datetime.fromtimestamp(
+                    status_path.stat().st_mtime, tz=timezone.utc
+                )
+    except OSError:
+        ended = None
+    if ended is not None:
+        if ended.tzinfo is None:
+            ended = ended.replace(tzinfo=timezone.utc)
+        # A few seconds of slack: the agent writes its file, then the CLI exits
+        # and the wrapper stamps STATUS.json, so the legitimate ordering has
+        # the stray file just *before* the end -- but clock granularity and a
+        # slow exit can invert it by a hair.
+        if stray_mtime > ended + timedelta(seconds=5):
+            return None
+
     # Ambiguity means hands off. mtime rules out files older than this run, but
     # it cannot tell two *overlapping* runs in the same cwd apart: if A and B
     # both started before B wrote the file, its mtime is newer than both, and

@@ -303,3 +303,35 @@ def test_status_json_does_not_override_a_live_transcript(env, tmp_path):
         assert server._state_for(run, env["cfg"])[0] == "working"
     finally:
         server.derive_state = orig
+
+
+def test_process_matching_handles_the_console_script_shape():
+    """atlas-chat is a shebang console script, so ps shows the interpreter.
+
+    Observed on the host with the real binary:
+
+        /…/atlas-ui-3/.venv/bin/python3 .venv/bin/atlas-chat --list-models
+
+    argv[0] is python3, not atlas-chat — so anything matching only argv[0]
+    would see no agent process and report a working run as exited the moment
+    it started. Basename matching over every token is what makes it work.
+    """
+    from subagent_mcp.server import _looks_like_cli
+
+    real = (
+        "/home/garlan/ATLAS-GROUP/atlas-ui-3/.venv/bin/python3 "
+        ".venv/bin/atlas-chat --list-models"
+    )
+    assert _looks_like_cli(real, "atlas-chat")
+    # Absolute path (how the wrapper invokes it) works the same way.
+    assert _looks_like_cli(
+        "/usr/bin/python3 /opt/atlas/.venv/bin/atlas-chat --agent-mode -- hi",
+        "atlas-chat",
+    )
+    # A run.sh living under a directory that merely mentions the name is not
+    # an atlas-chat process.
+    assert not _looks_like_cli(
+        "bash /home/x/runs/20260904-add-atlas-chat-launcher/run.sh", "atlas-chat"
+    )
+    # And it must not answer for a different CLI.
+    assert not _looks_like_cli(real, "claude")

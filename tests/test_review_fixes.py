@@ -286,3 +286,54 @@ def test_finished_earlier_run_is_not_a_rival(tmp_path, env):
     assert (mine.run_dir / "RESULT.md").read_text(encoding="utf-8") == (
         "mine, written just now"
     )
+
+
+def test_file_created_after_the_run_exited_is_not_adopted(tmp_path, env):
+    """Reconciliation needs an upper bound, not just a lower one.
+
+    If a run finishes without writing its summary and an unrelated untracked
+    RESULT.md appears afterwards -- before anyone calls check_subagent -- its
+    mtime still clears the start bound. Adopting it would move a file the run
+    cannot have written, and a later sweep would delete it.
+    """
+    import os
+
+    from subagent_mcp.runs import create_run_dir
+
+    cfg = env["cfg"]
+    set_config(cfg)
+    work = tmp_path / "bounded"
+    work.mkdir()
+    run = create_run_dir(
+        cfg.runs_root,
+        session="s",
+        window="w",
+        cwd=work,
+        cli="claude",
+        model=None,
+        agent=None,
+        task="bounded",
+        argv=[],
+    )
+    # Coherent timeline: started two hours ago, exited an hour ago, wrote no
+    # RESULT.md. (create_run_dir stamps "now", so wind it back.)
+    started = datetime.now(timezone.utc) - timedelta(hours=2)
+    run.start_time = started.isoformat()
+    run.write_meta()
+    ended = datetime.now(timezone.utc) - timedelta(hours=1)
+    (run.run_dir / "STATUS.json").write_text(
+        json.dumps({"exit_code": 0, "ended_at": ended.isoformat()}), encoding="utf-8"
+    )
+
+    stray = work / "RESULT.md"
+    stray.write_text("written by a human, after the run was over", encoding="utf-8")
+
+    assert _reconcile_stray_result(run) is None
+    assert stray.is_file()
+    assert not (run.run_dir / "RESULT.md").exists()
+
+    # The legitimate ordering -- agent writes the file, then the CLI exits --
+    # sits inside [started, ended] and is still reconciled.
+    within = time.time() - 3600 - 60
+    os.utime(stray, (within, within))
+    assert _reconcile_stray_result(run) == str(stray)
