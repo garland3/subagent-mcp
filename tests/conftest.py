@@ -35,7 +35,7 @@ def env(tmp_path_factory, monkeypatch):
         any_cwd=True,
         tmux_socket=socket,
         max_concurrent=5,
-        cli_allowlist=("claude", "opencode"),
+        cli_allowlist=("claude", "opencode", "atlas-chat"),
         # Point transcript roots at tmp so tests never read the host's real
         # ~/.claude/projects or ~/.local/share/opencode state. State-derivation
         # tests write synthetic transcripts under these.

@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -16,13 +17,14 @@ from pydantic import Field
 
 from .cli_paths import augmented_path, resolve_cli, searched_dirs
 from .config import ServerConfig, cwd_is_allowed, get_config
-from .runners import RunnerError, build_runner
+from .runners import RunnerError, build_runner, validate_cli_args
 from .runs import (
     Run,
     choose_window_name,
     create_run_dir,
     delete_run_dirs,
     derive_state,
+    is_sweepable,
     prune_runs,
     registry as runs_registry,
     update_run_pane,
@@ -40,7 +42,8 @@ from .watching import (
 
 
 _DEFAULT_INSTRUCTIONS = (
-    "Launch coding-CLI subagents (claude, opencode) in tmux windows — detached by "
+    "Launch coding-CLI subagents (claude, opencode, atlas-chat) in tmux windows — "
+    "detached by "
     "default, or visible with watch='switch'/'terminal'. Tools: launch_subagent, "
     "check_subagent, watch_subagent, list_subagents, send_to_subagent, "
     "resume_subagent, stop_subagent, sweep_stale_subagents."
@@ -179,17 +182,197 @@ _RESULT_MD_MAX_CHARS = 4000
 _RESULT_MD_MAX_LINES = 80
 
 
+def _invocation_window(run: Run) -> tuple[datetime | None, datetime | None]:
+    """(start, end) of the run's most recent invocation; end None = still going.
+
+    Both halves must come from the same invocation. A resumed run keeps its
+    original ``start_time`` on the record while its STATUS.json describes the
+    latest resume -- pairing those two spans the idle gap between them, and
+    anything written during that gap would look like it happened while the run
+    was active. So when STATUS.json carries its own ``started_at``, that pair
+    wins; the record's ``start_time`` is only the fallback for a run that has
+    not produced a status yet (which is also the case where the run is still
+    going, hence an open-ended window).
+    """
+
+    def _parse(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    status_path = run.run_dir / "STATUS.json"
+    recorded: dict[str, Any] = {}
+    status_mtime: datetime | None = None
+    try:
+        if status_path.is_file():
+            status_mtime = datetime.fromtimestamp(
+                status_path.stat().st_mtime, tz=timezone.utc
+            )
+            try:
+                loaded = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    recorded = loaded
+            except (json.JSONDecodeError, OSError, ValueError):
+                recorded = {}
+    except OSError:
+        status_mtime = None
+
+    if status_mtime is not None:
+        # The wrapper writes both halves; ended_at falls back to the file's
+        # own mtime, which is when it was written.
+        started = _parse(recorded.get("started_at"))
+        ended = _parse(recorded.get("ended_at")) or status_mtime
+        if started is not None:
+            return started, ended
+        # A status without a usable started_at cannot define a window on its
+        # own; fall through to the record's start, keeping this end.
+        return _parse(run.start_time), ended
+
+    # No status yet: the run has not finished, so the window is open-ended.
+    return _parse(run.start_time), None
+
+
+def _reconcile_stray_result(run: Run) -> str | None:
+    """Recover a RESULT.md the agent wrote into its working directory.
+
+    The standing instruction gives an absolute path inside the run directory,
+    but a model that pattern-matches on the filename can write ``./RESULT.md``
+    instead -- which lands *inside the repo*, where ``git add -A`` will sweep it
+    into a commit. That is the failure this function exists to catch.
+
+    Moves the stray file into the run directory and returns the path it came
+    from, so the caller can report it. Does nothing (returns None) when the run
+    directory already holds a result: a compliant write is authoritative, and a
+    pre-existing ``RESULT.md`` in the repo may well be a legitimate project file
+    that predates this run and must not be moved.
+
+    Deliberately conservative -- this touches a file in the user's repo:
+    - Only ever the exact path ``<cwd>/RESULT.md``; never a recursive search.
+    - Never overwrites; skips when the destination exists.
+    - Skips a tracked file. ``git ls-files --error-unmatch`` returning 0 means
+      the file is committed, so it belongs to the project, not to this run.
+    - Any OSError leaves the file untouched. A failed reconcile must not fail
+      the check that called it.
+    """
+    dest = run.run_dir / "RESULT.md"
+    if dest.exists():
+        return None
+
+    stray = run.cwd / "RESULT.md"
+    try:
+        if not stray.is_file():
+            return None
+    except OSError:
+        return None
+
+    # Provenance, not just untrackedness. An untracked RESULT.md that predates
+    # the run cannot be this run's output -- it is someone's local scratch file,
+    # and moving it would silently remove it from their working tree (and let a
+    # later sweep_stale_subagents delete it for good).
+    #
+    # The window has to come from ONE invocation. A resumed run's
+    # ``start_time`` describes the original launch while its STATUS.json
+    # describes the latest resume, so pairing them spans the idle gap in
+    # between -- and a file someone wrote during that gap would look like this
+    # run's output. ``_invocation_window`` keeps the halves together.
+    try:
+        stray_mtime = datetime.fromtimestamp(stray.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+    started, ended = _invocation_window(run)
+    if started is None:
+        return None
+    # A second of slack below, five above: filesystem mtimes and our ISO
+    # timestamps are not sampled from the same clock read, and the legitimate
+    # ordering at the end is "agent writes the file, CLI exits, wrapper stamps
+    # STATUS.json", which a slow exit can invert by a hair.
+    if stray_mtime < started - timedelta(seconds=1):
+        return None
+    if ended is not None and stray_mtime > ended + timedelta(seconds=5):
+        return None
+
+    # Ambiguity means hands off. The window above says the file appeared while
+    # this run was active; it cannot say no *other* run was active too. Two
+    # overlapping runs in one cwd both contain the mtime, so reconciling the
+    # first would move the second's result under the wrong name -- where a
+    # later sweep deletes it. A stray file carries no run-specific marker to
+    # break the tie (the whole point of this path is that the agent ignored
+    # $SUBAGENT_RESULT_FILE, which is the marker), so when more than one run
+    # could plausibly have written it, no one claims it.
+    #
+    # A fresh scan, deliberately. It looks like a per-check cost but is not:
+    # the `stray.is_file()` gate above returns first in the overwhelmingly
+    # common case where the agent complied and no stray file exists, so this
+    # only runs when there is actually something to reconcile.
+    try:
+        others = [
+            other
+            for other in _load_registry().values()
+            if other.run_id != run.run_id and other.cwd == run.cwd
+        ]
+    except Exception:
+        others = []
+    for other in others:
+        other_started, other_ended = _invocation_window(other)
+        if other_started is None:
+            # Unknown window: cannot rule it out, so it counts as a rival.
+            return None
+        if other_started > stray_mtime + timedelta(seconds=1):
+            continue  # started after the file existed; cannot have written it
+        if other_ended is not None and other_ended < stray_mtime - timedelta(seconds=5):
+            continue  # already exited when the file appeared
+        # Active when the file appeared: just as plausible an author as ours.
+        return None
+
+    # A tracked RESULT.md is project content, not agent output. Moving it would
+    # show up as a deletion in the user's working tree -- far worse than the
+    # stray file we are trying to clean up.
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "RESULT.md"],
+            cwd=str(run.cwd),
+            capture_output=True,
+            timeout=10,
+        )
+        if tracked.returncode == 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        # Not a git repo, or git is unavailable. Falling through is safe: the
+        # move is still non-destructive because dest is known not to exist.
+        pass
+
+    # No log line here: this package writes nothing to stdout (it would corrupt
+    # the stdio MCP stream) and has no logger. The reconcile is reported through
+    # the payload instead, which is where the operator will actually see it. A
+    # failed move leaves ``result="none"`` -- already a visible state.
+    try:
+        shutil.move(str(stray), str(dest))
+    except OSError:
+        return None
+
+    return str(stray)
+
+
 def _result_payload(run: Run) -> dict[str, Any]:
     """Read RESULT.md and STATUS.json for an idle run.
 
     Returns a dict with:
     - ``result``: "present" or "none" (never silent success — §1.1/§5.2)
     - ``result_md``: content of RESULT.md, capped to keep the payload small
+    - ``result_reconciled_from``: set only when the agent wrote the file into
+      its working directory and it was moved back; surfaced so non-compliance
+      is visible rather than silently repaired
     - ``status``: parsed STATUS.json (exit code, git SHAs, changed files) or None
 
     Absence of RESULT.md is ``result="none"`` — the design (§3.4 risk 8) calls
     this out: "Make absence a visible state."
     """
+    reconciled_from = _reconcile_stray_result(run)
     result_path = run.run_dir / "RESULT.md"
     result_md = ""
     result_status = "none"
@@ -216,7 +399,14 @@ def _result_payload(run: Run) -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             status = None
 
-    return {"result": result_status, "result_md": result_md, "status": status}
+    payload: dict[str, Any] = {
+        "result": result_status,
+        "result_md": result_md,
+        "status": status,
+    }
+    if reconciled_from:
+        payload["result_reconciled_from"] = reconciled_from
+    return payload
 
 
 def _live_panes(tm: Tmux) -> set[tuple[str, int]]:
@@ -240,11 +430,140 @@ def _is_alive(run: Run, live: set[tuple[str, int]]) -> bool:
     return any(pane_id == run.pane_id for pane_id, _ in live)
 
 
+# ---------------------------------------------------------------------------
+# Agent-process liveness.
+#
+# A pane outliving its agent is the NORMAL end state here, not an anomaly: the
+# generated run.sh ends with ``exec "$SHELL" -i`` so the window stays open for
+# inspection after the CLI exits. That makes "the pane exists" useless as a
+# proxy for "the agent is running" — a finished run looks alive forever, never
+# becomes sweepable, and reads as `alive: true` in list_subagents.
+#
+# tmux's own #{pane_current_command} is no better: the pane's foreground
+# process is the run.sh wrapper, so it reports "bash" while claude/opencode is
+# very much alive as its child. The only honest signal is the pane's process
+# subtree: is a process for this run's CLI still in it?
+# ---------------------------------------------------------------------------
+
+
+def _ps_snapshot() -> list[tuple[int, int, str]] | None:
+    """(pid, ppid, args) for every process, or None if ps is unavailable."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out: list[tuple[int, int, str]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            out.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else ""))
+        except ValueError:
+            continue
+    return out
+
+
+def _looks_like_cli(args: str, cli: str) -> bool:
+    """True when a command line invokes ``cli``.
+
+    Matched on the basename of any argv token so an interpreted CLI counts:
+    a shebang script shows up as ``python3 /path/to/claude``, and the tests'
+    fake CLIs are exactly that shape. Substring matching on the whole line
+    would false-positive on any path mentioning ``.claude/``.
+    """
+    for token in args.split():
+        if token.rsplit("/", 1)[-1] == cli:
+            return True
+    return False
+
+
+def _agent_pids(
+    pane_pid: int | None,
+    cli: str,
+    snapshot: list[tuple[int, int, str]] | None = None,
+) -> list[int] | None:
+    """PIDs of ``cli`` processes inside the pane's process subtree.
+
+    None means "could not tell" (no ps, or no recorded pane pid) — callers
+    treat that as "assume it is running" so we never report a live agent as
+    finished on missing evidence.
+    """
+    if pane_pid is None:
+        return None
+    # Callers listing many runs pass one snapshot in rather than forking a
+    # `ps` per run -- an N-run listing was N `ps` invocations. Anything that
+    # acts and then re-checks (the stop ladder) must keep passing None so it
+    # re-reads, or it would verify a kill against a pre-kill snapshot.
+    if snapshot is None:
+        snapshot = _ps_snapshot()
+    if snapshot is None:
+        return None
+    children: dict[int, list[int]] = {}
+    args_by_pid: dict[int, str] = {}
+    for pid, ppid, args in snapshot:
+        children.setdefault(ppid, []).append(pid)
+        args_by_pid[pid] = args
+    found: list[int] = []
+    stack = list(children.get(pane_pid, []))
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if _looks_like_cli(args_by_pid.get(pid, ""), cli):
+            found.append(pid)
+        stack.extend(children.get(pid, []))
+    return found
+
+
+def _agent_running(
+    run: Run,
+    live: set[tuple[str, int]],
+    snapshot: list[tuple[int, int, str]] | None = None,
+) -> bool:
+    """True when the run's CLI process is still running in its pane.
+
+    This — not pane existence — is what "alive" means to a caller asking
+    whether a subagent is still working.
+    """
+    if not _is_alive(run, live):
+        return False
+    pids = _agent_pids(run.pane_pid, run.cli, snapshot)
+    if pids is None:
+        # No evidence either way: fall back to pane liveness rather than
+        # declaring a possibly-working agent finished.
+        return True
+    return bool(pids)
+
+
+def _liveness(
+    run: Run,
+    live: set[tuple[str, int]],
+    snapshot: list[tuple[int, int, str]] | None = None,
+) -> str:
+    """'running' (agent alive) | 'exited' (pane open, agent gone) | 'gone' (no pane)."""
+    if not _is_alive(run, live):
+        return "gone"
+    return "running" if _agent_running(run, live, snapshot) else "exited"
+
+
 def _active_count(tm: Tmux, cfg: ServerConfig | None = None) -> int:
     cfg = cfg or _cfg()
     reg = _load_registry(cfg)
     live = _live_panes(tm)
-    return sum(1 for run in reg.values() if _is_alive(run, live))
+    # Concurrency is about agents doing work, not panes sitting at a shell
+    # prompt after their agent exited — those must not consume slots.
+    snapshot = _ps_snapshot()
+    return sum(1 for run in reg.values() if _agent_running(run, live, snapshot))
 
 
 def _state_for(run: Run, cfg: ServerConfig) -> tuple[str, str]:
@@ -261,11 +580,32 @@ def _state_for(run: Run, cfg: ServerConfig) -> tuple[str, str]:
     override, sentinel_activity = _check_stop_sentinel(run)
     if override:
         return override, sentinel_activity
-    return derive_state(
+    state, last_activity = derive_state(
         run,
         claude_projects_root=cfg.claude_projects_root,
         opencode_state_root=cfg.opencode_state_root,
     )
+    if state:
+        return state, last_activity
+    # No transcript to read. For a one-shot CLI like atlas-chat there never
+    # will be one, so "unknown" would be permanent -- and check_subagent only
+    # returns RESULT.md/STATUS.json for an *idle* run, meaning the advertised
+    # completion path would never fire for it.
+    #
+    # STATUS.json is the evidence that closes the gap: run.sh writes it only
+    # after the CLI has exited, so its existence *is* completion. Rung 3 of
+    # the ladder, below the Stop-hook sentinel and the transcript, and used
+    # only when both are silent -- so this never overrides a live claude run.
+    status_path = run.run_dir / "STATUS.json"
+    try:
+        if status_path.is_file():
+            mtime = datetime.fromtimestamp(
+                status_path.stat().st_mtime, tz=timezone.utc
+            )
+            return "idle", mtime.isoformat()
+    except OSError:
+        pass
+    return "", last_activity
 
 
 # ---------------------------------------------------------------------------
@@ -620,14 +960,25 @@ def _tail(text: str, lines: int = 40, *, strip_box: bool = True) -> str:
 # sometimes meaningful inside an output line.
 _BOX_CHARS = frozenset(chr(c) for c in range(0x2500, 0x25A0))
 
+# The TUI pads to the full pane width, so removing the border characters
+# leaves long runs of spaces *inside* surviving lines. Dropping
+# whitespace-only lines never caught those: they were still 15% of every
+# launch result and 11% of every listing. Collapse to two spaces — enough to
+# keep columns visually separated, cheap enough to stop paying for padding.
+_SPACE_RUN = re.compile(r" {3,}")
+
 
 def _strip_box_drawing(text: str) -> str:
-    """Remove TUI border characters and drop the lines that become empty."""
+    """Remove TUI border characters and the padding they leave behind.
+
+    Drops lines that become empty, and collapses runs of three or more spaces
+    within a line to two.
+    """
     kept: list[str] = []
     for line in text.splitlines():
         cleaned = "".join(c for c in line if c not in _BOX_CHARS)
         if cleaned.strip():
-            kept.append(cleaned.rstrip())
+            kept.append(_SPACE_RUN.sub("  ", cleaned).rstrip())
     return "\n".join(kept)
 
 
@@ -682,8 +1033,9 @@ def _resolve_executable(cli: str) -> str:
     if path:
         return path
     raise ToolError(
-        f"{cli!r} was not found on PATH. Searched: {', '.join(searched_dirs())}. "
-        f"Set SUBAGENT_CLI_{cli.upper()}=/absolute/path/to/{cli} (or add its "
+        f"{cli!r} was not found on PATH. Searched: {', '.join(searched_dirs(cli))}. "
+        f"Set SUBAGENT_CLI_{cli.upper().replace('-', '_')}=/absolute/path/to/{cli} "
+        "(or add its "
         "directory to the PATH of the process running subagent-mcp)."
     )
 
@@ -745,7 +1097,16 @@ def _apply_watch(tm: Tmux, cfg: ServerConfig, run: Run, mode: str) -> dict[str, 
 
 
 def _start_output_log(tm: Tmux, run: Run) -> str:
-    """Tee the pane into <run_dir>/output.log so it can be tail -f'd."""
+    """Tee the raw pane byte stream into <run_dir>/output.log.
+
+    Caveat worth knowing before you reach for this file: a full-screen TUI
+    positions the cursor with escape sequences instead of emitting newlines,
+    so the log is one enormous line of ANSI — an 11 MB run had **zero**
+    newlines. It is a `less -R` / replay artefact for a human, not text.
+    Reconstructing lines from it needs a terminal emulator. Use
+    ``check_subagent`` (which captures the *rendered* screen) for anything
+    programmatic, and never hand this path to a file-reading tool.
+    """
     log_path = run.run_dir / "output.log"
     try:
         tm.pipe_pane(run.pane_id, f"cat >> {shlex.quote(str(log_path))}")
@@ -759,7 +1120,7 @@ def launch_subagent(
     prompt_file: Annotated[str | None, Field(description="Path to a prompt file (fallback if prompt not provided)")] = None,
     prompt_mode: Annotated[str, Field(description="'inline' feeds the prompt on argv; 'pointer' feeds a bootstrap read-the-file prompt")] = "inline",
     cwd: Annotated[str | None, Field(description="Working directory for the subagent")] = None,
-    cli: Annotated[str, Field(description="CLI to launch: claude or opencode")] = "claude",
+    cli: Annotated[str, Field(description="CLI to launch: claude, opencode, or atlas-chat")] = "claude",
     session: Annotated[str | None, Field(description="tmux session name; defaults to basename(cwd)")] = None,
     window: Annotated[str | None, Field(description="tmux window name; defaults to task or prompt slug")] = None,
     task: Annotated[str | None, Field(description="Short human label for the window name")] = None,
@@ -771,7 +1132,7 @@ def launch_subagent(
     watch: Annotated[str | None, Field(description="'off' = detached (default); 'switch' = pull an attached tmux client to this window; 'terminal' = open a terminal emulator on it")] = None,
     dry_run: Annotated[bool, Field(description="Return the generated wrapper without launching")] = False,
 ) -> str:
-    """Launch a coding-CLI subagent (claude or opencode) in a detached tmux window.
+    """Launch a coding-CLI subagent (claude, opencode, or atlas-chat) in a detached tmux window.
 
     Use this instead of `tmux new-window` so the run gets a minted or captured
     session_id (resumable later via claude --resume / opencode run -s), a run
@@ -781,6 +1142,11 @@ def launch_subagent(
 
     The handle is the run_id or the full session:window (e.g. atlas:fixit) —
     never a bare window name, which can resolve to the wrong session.
+
+    atlas-chat is ATLAS's own one-shot chat CLI: it answers once and exits, has
+    no conversation id, and so cannot be resumed or sent follow-ups. Pass the
+    whole task in the prompt. Its `agent` argument is rejected (no equivalent
+    flag) and `dangerous` selects --agent-mode, which lets the model call tools.
     """
     cfg = _cfg()
     tm = _tmux(cfg)
@@ -808,6 +1174,15 @@ def launch_subagent(
     if prompt_mode not in ("inline", "pointer"):
         raise ToolError("prompt_mode must be 'inline' or 'pointer'")
 
+    # Reject arguments this CLI cannot express *before* create_run_dir writes
+    # a run directory and registers the run. Raising after that point left a
+    # phantom dead run behind for list_subagents and the retention sweep to
+    # trip over, for a launch that never happened.
+    try:
+        validate_cli_args(cli, agent=agent)
+    except RunnerError as exc:
+        raise ToolError(str(exc)) from exc
+
     # Mint the CLI conversation id up front when the CLI supports it. claude
     # takes --session-id <uuid>; opencode has no pre-assign flag and the id is
     # captured post-launch instead. Recording both on the Run is the key gap
@@ -819,6 +1194,11 @@ def launch_subagent(
     if cli == "claude":
         session_id = str(uuid.uuid4())
         session_id_status = "minted"
+    elif cli == "atlas-chat":
+        # atlas-chat has no conversation id at all — not "we failed to capture
+        # one", but "there is none to capture". Say so explicitly so the resume
+        # paths can give a useful reason instead of a generic "missing".
+        session_id_status = "unsupported"
     # opencode: session_id stays "" here; captured after the pane is up.
 
     effective_session = session or cwd_path.name or "subagent"
@@ -928,7 +1308,11 @@ def launch_subagent(
     try:
         raw_output = tm.capture_pane(pane_id, lines=100)
         live = _live_panes(tm)
-        alive = _is_alive(run, live)
+        # Agent liveness, not pane existence: a one-shot CLI (atlas-chat) can
+        # finish inside settle_seconds, leaving run.sh parked at its shell. The
+        # pane is alive; the agent is not. Reporting pane liveness here made
+        # launch say alive=true while an immediate check_subagent said false.
+        alive = _agent_running(run, live)
         current_command = tm.pane_command(pane_id)
     except TmuxError:
         raw_output = ""
@@ -959,6 +1343,8 @@ def launch_subagent(
             "executable": executable,
             "run_dir": str(run.run_dir),
             "output_log": output_log,
+            "output_log_note": "raw ANSI pane dump, not line-oriented text —"
+            " read it with check_subagent, not a file tool",
             # The CLI conversation id — the durable, resumable handle.
             # Empty with status="capture_failed" means the run is NOT
             # resumable through us; the human must find the session by hand.
@@ -998,6 +1384,11 @@ def check_subagent(
     result="none", never silent success. While working, returns the tail of
     the pane output (box-drawing stripped, capped).
 
+    If the agent wrote its RESULT.md into the working directory instead of the
+    run directory, the file is moved back and result_reconciled_from names the
+    path it came from. That means a stray file was left inside the repo and
+    could have been committed by accident — worth mentioning to the operator.
+
     Use this instead of `tmux capture-pane` so you get the transcript-derived
     state (working|idle, not just TUI chrome) and so the run is reconciled
     if the pane is gone (a closed pane returns a dead snapshot, not an error).
@@ -1005,6 +1396,10 @@ def check_subagent(
     The handle is the run_id from launch_subagent or the full session:window
     (e.g. atlas:fixit) — never a bare window name, which can resolve to the
     wrong session.
+
+    This is the tool for reading a subagent's output. The ``output_log`` path
+    in the reply is a raw ANSI pane dump with no line structure — do not pass
+    it to a file-reading tool; it is there for a human with `less -R`.
     """
     cfg = _cfg()
     tm = _tmux(cfg)
@@ -1021,7 +1416,8 @@ def check_subagent(
 
     try:
         output = tm.capture_pane(run.pane_id, lines=lines)
-        alive = _is_alive(run, _live_panes(tm))
+        pane_state = _liveness(run, _live_panes(tm))
+        alive = pane_state == "running"
         current_command = tm.pane_command(run.pane_id)
     except TmuxError:
         # The pane has closed (e.g., Ctrl-C killed the wrapper). Report it as
@@ -1037,6 +1433,7 @@ def check_subagent(
                 "session_id": run.session_id,
                 "session_id_status": run.session_id_status,
                 "alive": False,
+                "pane": "gone",
                 "current_command": "",
                 "output": "",
                 "state": state,
@@ -1072,6 +1469,7 @@ def check_subagent(
             "session_id": run.session_id,
             "session_id_status": run.session_id_status,
             "alive": alive,
+            "pane": pane_state,
             "current_command": current_command or "",
             "output": pane_output,
             "state": state,
@@ -1112,7 +1510,7 @@ def watch_subagent(
             "run_id": run.run_id,
             "pane_id": run.pane_id,
             "target": f"{run.session}:{run.window}",
-            "alive": _is_alive(run, _live_panes(tm)),
+            "alive": _agent_running(run, _live_panes(tm)),
             "output_log": str(log_path) if log_path.exists() else "",
             **info,
         }
@@ -1122,13 +1520,33 @@ def watch_subagent(
 def list_subagents(
     session: Annotated[str | None, Field(description="Filter to one tmux session")] = None,
 ) -> str:
-    """List all launched subagents with their run_id, state (working|idle), liveness, and age.
+    """List launched subagents: run_id, liveness, state (working|idle), age, result.
 
     Use this instead of `tmux list-windows` so you get the recorded run
     metadata and the transcript-derived state, not just live window names.
     Returns run_id handles you can pass to the other subagent_* tools. The
     state is derived from the CLI's own transcript and is reported even for
     runs whose panes are no longer alive.
+
+    **Read the counts before describing the fleet.** The reply has `total`,
+    `alive`, and `dead` — a run with `alive: false` is dead, not running, no
+    matter what its `state` says. `state` is where the transcript stopped, so
+    a dead run is normally `idle`; that pair means "finished or gone", not
+    "working".
+
+    `alive` means **the CLI process is still running**, not that a tmux pane
+    exists. The two differ constantly: the launcher's wrapper ends with an
+    interactive shell, so a pane normally outlives its agent. `pane` tells
+    you which case a run is in — `running` (agent working), `exited` (agent
+    finished, pane still open at a shell), or `gone` (no pane). An `exited`
+    run is finished: nothing will type into it again, `stop_subagent` has
+    nothing left to stop, and `sweep_stale_subagents` will reap its record.
+
+    **`task` is the only record of what a run was asked to do**, and it is
+    just the short label from launch. This tool does NOT report what an agent
+    did, concluded, or is waiting on. `result: "present"` means the run wrote
+    a RESULT.md — call `check_subagent` to read it. Do not infer or describe
+    an agent's work from its run_id or task slug; say what the fields say.
     """
     cfg = _cfg()
     tm = _tmux(cfg)
@@ -1137,12 +1555,17 @@ def list_subagents(
     # One tmux round-trip for the whole listing; _is_alive handles both the
     # pid-verified and the legacy pane-id-only cases from this single snapshot.
     live = _live_panes(tm)
+    # ...and one `ps` for the whole listing, for the same reason: liveness is
+    # per-run but the process table is not, and forking a `ps` per run made a
+    # listing O(N) subprocesses.
+    ps = _ps_snapshot()
     items: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
     for run in sorted(reg.values(), key=lambda r: r.start_time or ""):
         if session and run.session != session:
             continue
-        alive = _is_alive(run, live)
+        pane_state = _liveness(run, live, ps)
+        alive = pane_state == "running"
         age = ""
         if run.start_time:
             try:
@@ -1154,26 +1577,41 @@ def list_subagents(
         # is independent of pane liveness — this is the signal that has to
         # survive containerisation (no TTY required).
         state, last_activity = _state_for(run, cfg)
+        # `session` and `window` are dropped: `target` already carries both.
+        # `session_id` is dropped too — it is a long opaque string and no tool
+        # takes it as an argument (they all take a handle); `session_id_status`
+        # is what actually tells the caller whether a resume is possible.
         items.append(
             {
                 "run_id": run.run_id,
                 "pane_id": run.pane_id,
                 "target": f"{run.session}:{run.window}",
-                "session": run.session,
-                "window": run.window,
                 "cli": run.cli,
                 "cwd": str(run.cwd),
                 "task": run.task,
-                "session_id": run.session_id,
                 "session_id_status": run.session_id_status,
                 "alive": alive,
+                "pane": pane_state,
                 "age": age,
                 "state": state,
                 "last_activity": last_activity,
+                "result": "present" if (run.run_dir / "RESULT.md").is_file() else "none",
             }
         )
 
-    return _json({"count": len(items), "subagents": items})
+    n_alive = sum(1 for item in items if item["alive"])
+    n_exited = sum(1 for item in items if item["pane"] == "exited")
+    # No bare `count`: it was read as "N agents are running" even when most of
+    # the N were dead. Make the split unmissable and unambiguous.
+    return _json(
+        {
+            "total": len(items),
+            "alive": n_alive,
+            "dead": len(items) - n_alive,
+            "finished_pane_open": n_exited,
+            "subagents": items,
+        }
+    )
 
 
 def send_to_subagent(
@@ -1187,6 +1625,11 @@ def send_to_subagent(
     the paste uses a named buffer (no shell expansion of the text). The
     handle is the run_id or the full session:window (e.g. atlas:fixit) —
     never a bare window name, which can resolve to the wrong session.
+
+    This tool types into a **live** pane. If the pane is gone, use
+    `resume_subagent` instead: it reconstitutes the conversation from the
+    CLI's persisted session on disk and does not need a TTY. A dead pane here
+    raises an error naming that call rather than failing on a raw tmux error.
     """
     cfg = _cfg()
     tm = _tmux(cfg)
@@ -1194,6 +1637,33 @@ def send_to_subagent(
 
     if not run.pane_id:
         raise ToolError(f"Run {run.run_id!r} has no pane id")
+
+    # Reconcile before typing. stop_subagent already treats a vanished pane as
+    # a state to handle rather than an error; send did not, so it surfaced a
+    # bare "tmux send failed: can't find pane: %16" and left the caller with no
+    # next step — even though resume_subagent exists for exactly this case.
+    pane_state = _liveness(run, _live_panes(tm))
+    if pane_state != "running":
+        resumable = run.session_id and run.session_id_status != "capture_failed"
+        detail = (
+            f"Use resume_subagent(handle={run.run_id!r}, message=…) to continue "
+            "this session from its transcript."
+            if resumable
+            else "No usable session id was recorded for this run "
+            f"(session_id_status={run.session_id_status!r}), so it cannot be "
+            "resumed; launch a new subagent instead."
+        )
+        where = (
+            f"its pane ({run.pane_id}) is gone"
+            if pane_state == "gone"
+            else f"its {run.cli} process has exited and pane {run.pane_id} is "
+            "just a shell prompt now (typing there would run your text as a "
+            "shell command, not send it to the agent)"
+        )
+        raise ToolError(
+            f"Run {run.run_id!r} is not alive — {where}, "
+            f"so there is nothing to type into. {detail}"
+        )
 
     try:
         tm.load_buffer(text, buffer_name=run.run_id)
@@ -1210,14 +1680,29 @@ def send_to_subagent(
 
 def stop_subagent(
     handle: Annotated[str, Field(description="run_id, pane id, or sess:win target")],
-    kill_window: Annotated[bool, Field(description="Kill the tmux window instead of sending Ctrl-C")] = False,
+    kill_window: Annotated[bool, Field(description="Also close the tmux window once the agent is stopped (default: leave it open at a shell so the scrollback survives)")] = False,
 ) -> str:
-    """Stop a subagent by sending Ctrl-C (default) or killing its tmux window.
+    """Stop a subagent's CLI process, escalating until it is actually gone.
+
+    **This verifies the kill.** One Ctrl-C does not stop a TUI CLI — claude
+    and opencode read it as "cancel the current input", so the old
+    send-one-C-c-and-report-success behaviour left the agent running while
+    the reply looked like a stop. The ladder now runs Ctrl-C → second Ctrl-C
+    → SIGTERM → SIGKILL, re-checking the pane's process subtree after each
+    rung, and stops at the first one that works. The reply's `stopped` says
+    whether the process is really gone and `method` says which rung did it.
 
     A pane that is already gone is SUCCESS, not an error: the run directory is
     reconciled (removed from the registry) and a dead snapshot is returned.
     This fixes the measured 33% stop_subagent error rate, whose cause was
     stale run_ids pointing at panes already gone — not lingering panes.
+
+    **Stopping does not remove the run from list_subagents.** The record and
+    its RESULT.md deliberately survive so you can still read them; the run
+    just flips to `alive: false`. `sweep_stale_subagents` is what deletes
+    stopped runs' records (and closes their leftover panes). Killing the
+    agent also leaves the pane open at a shell by default — pass
+    kill_window=True to close the window too.
 
     Use this instead of `tmux send-keys C-c`/`tmux kill-window` so the run is
     resolved by handle and dead panes are cleaned up rather than raising.
@@ -1263,70 +1748,288 @@ def stop_subagent(
         delete_run_dirs(cfg.runs_root, [run.run_id])
         return _dead_snapshot(reconciled=True)
 
-    try:
+    # Track the CLI pids we have seen. Signalling can kill the pane's wrapper
+    # and orphan the agent — reparented to init, out of the pane's subtree,
+    # still burning tokens. Watching only the subtree would call that a
+    # successful stop, so surviving known pids count as running too.
+    tracked: set[int] = set()
+
+    def _live_agent_pids() -> list[int]:
+        try:
+            pane_live = _is_alive(run, _live_panes(tm))
+        except TmuxError:
+            pane_live = False
+        pids: set[int] = set()
+        if pane_live:
+            pids.update(_agent_pids(run.pane_pid, run.cli) or [])
+        tracked.update(pids)
+        snapshot = _ps_snapshot()
+        if snapshot is not None:
+            # A tracked pid still present *and* still running this CLI. The
+            # args re-check is what makes pid reuse harmless here.
+            by_pid = {pid: args for pid, _ppid, args in snapshot}
+            pids.update(
+                pid
+                for pid in tracked
+                if pid in by_pid and _looks_like_cli(by_pid[pid], run.cli)
+            )
+        return sorted(pids)
+
+    def _still_running() -> bool:
+        return bool(_live_agent_pids())
+
+    def _signal_live_agents(sig: str) -> int:
+        """Signal every CLI pid we can see, orphans included."""
+        sent = 0
+        for pid in _live_agent_pids():
+            try:
+                subprocess.run(
+                    ["kill", f"-{sig}", str(pid)], capture_output=True, timeout=5
+                )
+                sent += 1
+            except (OSError, subprocess.SubprocessError):
+                continue
+        return sent
+
+    # The agent may have finished on its own while its pane stayed open at the
+    # wrapper's shell — the normal end state, not something to signal. Sending
+    # Ctrl-C there would just poke a bash prompt. Guarded on being able to see
+    # processes at all: with no ps, "no pids found" means "no evidence", not
+    # "already finished" — that case falls through to the unverified path.
+    if _agent_pids(run.pane_pid, run.cli) is not None and not _still_running():
+        _remove_stop_hook(run, run.cwd)
+        pane_closed = False
         if kill_window:
-            # Kill by pane id so a reused window name in another session is never hit.
-            tm.kill_window(run.pane_id)
-        else:
+            try:
+                tm.kill_window(run.pane_id)
+                pane_closed = True
+            except TmuxError:
+                pane_closed = not _is_alive(run, _live_panes(tm))
+        try:
+            snapshot = json.loads(check_subagent(handle=run.pane_id, lines=20))
+        except ToolError:
+            snapshot = json.loads(_dead_snapshot(reconciled=False))
+        snapshot.update(
+            {
+                "stopped": True,
+                "verified": True,
+                "method": "already_exited",
+                "attempts": [],
+                "pane_closed": pane_closed,
+                "record_kept": True,
+                "note": f"The {run.cli} process had already exited; its pane was "
+                "just a shell prompt, so nothing needed signalling. The run "
+                "record stays in list_subagents (as alive: false) — call "
+                "sweep_stale_subagents to delete it.",
+            }
+        )
+        return _json(snapshot)
+
+    # Without a process snapshot there is nothing to verify against, and an
+    # escalation ladder that cannot see its own effect would run every rung
+    # up to SIGKILL for no reason. Fall back to the single Ctrl-C and say
+    # plainly that the stop is unverified.
+    if _agent_pids(run.pane_pid, run.cli) is None:
+        try:
             tm.send_keys(run.pane_id, "C-c")
-    except TmuxError:
-        # Race: the pane died between the alive check and the signal. Re-check
-        # and reconcile if it is now gone; otherwise re-raise the real error.
-        if not _is_alive(run, _live_panes(tm)):
-            _remove_stop_hook(run, run.cwd)
-            delete_run_dirs(cfg.runs_root, [run.run_id])
-            return _dead_snapshot(reconciled=True)
-        raise
+        except TmuxError:
+            if not _is_alive(run, _live_panes(tm)):
+                _remove_stop_hook(run, run.cwd)
+                delete_run_dirs(cfg.runs_root, [run.run_id])
+                return _dead_snapshot(reconciled=True)
+            raise
+        _remove_stop_hook(run, run.cwd)
+        if kill_window:
+            try:
+                tm.kill_window(run.pane_id)
+            except TmuxError:
+                pass
+        time.sleep(0.5)
+        try:
+            snapshot = json.loads(check_subagent(handle=run.pane_id, lines=20))
+        except ToolError:
+            snapshot = json.loads(_dead_snapshot(reconciled=False))
+        snapshot.update(
+            {
+                # `stopped` stays strictly boolean so callers can trust the
+                # type; the uncertainty rides in `verified` instead of
+                # overloading the same field with a string.
+                "stopped": False,
+                "verified": False,
+                "method": "ctrl-c",
+                "note": "Sent Ctrl-C but could not verify the process stopped "
+                f"(no process snapshot for pane pid {run.pane_pid!r}). One "
+                "Ctrl-C often only cancels a TUI CLI's current turn — check "
+                "the pane before reporting this agent as stopped.",
+            }
+        )
+        return _json(snapshot)
+
+    # The escalation ladder. Each rung acts, waits, then re-reads the pane's
+    # process subtree; we stop at the first rung that actually worked. Ctrl-C
+    # twice mirrors how these TUIs exit by hand (the first one only cancels
+    # the current turn), and SIGTERM/SIGKILL target the CLI process itself
+    # rather than the run.sh wrapper, so the wrapper still gets to write
+    # STATUS.json and drop to its shell.
+    def _ctrl_c() -> None:
+        """Ctrl-C the pane; a pane that vanished under us is not an error here.
+
+        Ctrl-C can take the run.sh wrapper down with it and leave the CLI
+        orphaned, so a dead pane means "keep climbing the ladder", not "stop".
+        """
+        try:
+            tm.send_keys(run.pane_id, "C-c")
+        except TmuxError:
+            if _is_alive(run, _live_panes(tm)):
+                raise
+
+    method = ""
+    attempts: list[dict[str, Any]] = []
+    for label, action, settle in (
+        ("ctrl-c", _ctrl_c, 1.0),
+        ("ctrl-c-twice", _ctrl_c, 1.5),
+        ("sigterm", lambda: _signal_live_agents("TERM"), 2.0),
+        ("sigkill", lambda: _signal_live_agents("KILL"), 1.0),
+    ):
+        action()
+        time.sleep(settle)
+        gone = not _still_running()
+        attempts.append({"method": label, "stopped": gone})
+        if gone:
+            method = label
+            break
+
+    stopped = bool(method)
+
+    # Pane gone and process gone: nothing is left to point a handle at, so
+    # reconcile the registry the way the already-dead path does.
+    if stopped and not _is_alive(run, _live_panes(tm)):
+        _remove_stop_hook(run, run.cwd)
+        snapshot = json.loads(_dead_snapshot(reconciled=False))
+        snapshot.update(
+            {
+                "stopped": True,
+                "verified": True,
+                "method": method,
+                "attempts": attempts,
+                "pane_closed": True,
+                "record_kept": True,
+                "note": "Agent stopped and its pane closed with it. The run "
+                "record stays in list_subagents (as alive: false) so RESULT.md "
+                "remains readable — call sweep_stale_subagents to delete it.",
+            }
+        )
+        return _json(snapshot)
 
     # The pane was stopped — remove the Stop hook entry even though the run
-    # dir stays (for sweep_stale_subagents to reap later). The hook script in
+    # dir stays (so RESULT.md and the transcript are still readable, and
+    # sweep_stale_subagents can reap the record later). The hook script in
     # the run dir is harmless once the settings entry is gone; resume_subagent
     # re-installs the hook if the run is resumed.
-    _remove_stop_hook(run, run.cwd)
+    if stopped:
+        _remove_stop_hook(run, run.cwd)
 
-    time.sleep(0.5)
+    pane_closed = False
+    if kill_window and _is_alive(run, _live_panes(tm)):
+        try:
+            # Kill by pane id so a reused window name in another session is never hit.
+            tm.kill_window(run.pane_id)
+            pane_closed = True
+        except TmuxError:
+            pane_closed = not _is_alive(run, _live_panes(tm))
+
+    time.sleep(0.3)
     try:
-        return check_subagent(handle=run.pane_id, lines=20)
+        snapshot = json.loads(check_subagent(handle=run.pane_id, lines=20))
     except ToolError:
-        return _dead_snapshot(reconciled=False)
+        snapshot = json.loads(_dead_snapshot(reconciled=False))
+    snapshot.update(
+        {
+            "stopped": stopped,
+            "verified": True,
+            "method": method,
+            "attempts": attempts,
+            "pane_closed": pane_closed,
+            "record_kept": True,
+            "note": (
+                "Agent stopped. The run record stays in list_subagents (as "
+                "alive: false) so RESULT.md remains readable — call "
+                "sweep_stale_subagents to delete stopped runs' records."
+                if stopped
+                else f"Could NOT stop the {run.cli} process — it survived "
+                "Ctrl-C, a second Ctrl-C, SIGTERM and SIGKILL. Investigate "
+                "the pane directly; do not report this run as stopped."
+            ),
+        }
+    )
+    return _json(snapshot)
 
 
 def sweep_stale_subagents(
     session: Annotated[str | None, Field(description="Only clear stale runs in this tmux session (None = all sessions)")] = None,
     dry_run: Annotated[bool, Field(description="Report what would be cleared without deleting")] = False,
 ) -> str:
-    """Delete run records for subagents whose tmux panes are no longer alive.
+    """Delete run records for subagents that are no longer running.
 
-    list_subagents marks dead panes but leaves their run directories on disk;
-    this tool reaps them. Live subagents are never touched. Use this instead
-    of manually pruning runs/ so only real runs with meta.json are touched.
-    Pass dry_run=True to preview, or use list_subagents first to see what is
-    stale.
+    Stale means the CLI process is gone — whether the pane went with it
+    (`pane: "gone"`) or is still sitting open at a shell prompt after the
+    agent exited (`pane: "exited"`). Both are finished runs; the second kind
+    is the normal end state, since the launcher's wrapper keeps the window
+    open. A leftover pane for a reaped run is closed too, so the tmux session
+    does not fill up with dead windows.
+
+    **This deletes RESULT.md along with the run directory.** Read anything
+    you still need (check_subagent) before sweeping. Runs whose agent is
+    still running are never touched. Use this instead of manually pruning
+    runs/ so only real runs with meta.json are touched. Pass dry_run=True to
+    preview, or use list_subagents first to see what is stale.
     """
     cfg = _cfg()
     tm = _tmux(cfg)
     reg = _load_registry(cfg)
     live = _live_panes(tm)
 
+    # Snapshot the size now. delete_run_dirs mutates the module-level run
+    # cache, and this count is reported after that call.
+    total_before = len(reg)
+
     stale: list[dict[str, Any]] = []
     stale_ids: list[str] = []
+    unsweepable: list[str] = []
+    # Panes that outlived their agent: reaping the record without closing
+    # these would leave orphan windows nothing can address any more.
+    orphan_panes: dict[str, str] = {}
     alive_count = 0
+    result_files: list[str] = []
     for run in sorted(reg.values(), key=lambda r: r.start_time or ""):
         if session and run.session != session:
             continue
-        if _is_alive(run, live):
+        state = _liveness(run, live)
+        if state == "running":
             alive_count += 1
             continue
+        if not is_sweepable(run.run_dir, cfg.runs_root):
+            # Discoverable (meta.json somewhere under runs_root) but nested, so
+            # delete_run_dirs will refuse it. Naming it is the point: silently
+            # folding it into "not found" is how a run that can never be reaped
+            # looks like a transient miss.
+            unsweepable.append(run.run_id)
+            continue
         stale_ids.append(run.run_id)
+        if state == "exited" and run.pane_id:
+            orphan_panes[run.run_id] = run.pane_id
+        has_result = (run.run_dir / "RESULT.md").is_file()
+        if has_result:
+            result_files.append(run.run_id)
         stale.append(
             {
                 "run_id": run.run_id,
                 "pane_id": run.pane_id,
                 "target": f"{run.session}:{run.window}",
-                "session": run.session,
-                "window": run.window,
                 "cli": run.cli,
                 "task": run.task,
+                "pane": state,
+                "result": "present" if has_result else "none",
             }
         )
 
@@ -1335,8 +2038,11 @@ def sweep_stale_subagents(
             {
                 "dry_run": True,
                 "would_clear": len(stale),
+                "would_close_panes": len(orphan_panes),
+                "would_delete_results": result_files,
                 "stale": stale,
                 "alive": alive_count,
+                "unsweepable": unsweepable,
             }
         )
 
@@ -1351,14 +2057,28 @@ def sweep_stale_subagents(
     removed_set = set(removed)
     not_found = [rid for rid in stale_ids if rid not in removed_set]
 
+    # Close the leftover shells only for records we actually removed, so a
+    # run whose directory survived keeps an inspectable pane.
+    panes_closed: list[str] = []
+    for rid, pane_id in orphan_panes.items():
+        if rid not in removed_set:
+            continue
+        try:
+            tm.kill_window(pane_id)
+            panes_closed.append(pane_id)
+        except TmuxError:
+            continue
+
     return _json(
         {
             "dry_run": False,
             "cleared": len(removed),
             "cleared_runs": removed,
+            "panes_closed": panes_closed,
             "not_found": not_found,
+            "unsweepable": unsweepable,
             "alive": alive_count,
-            "remaining_total": len(reg) - len(removed),
+            "remaining_total": total_before - len(removed),
         }
     )
 
@@ -1395,6 +2115,13 @@ def resume_subagent(
     run = _resolve_handle(handle, cfg)
 
     # The session id is the whole point — without it, resume is impossible.
+    if run.session_id_status == "unsupported":
+        raise ToolError(
+            f"Run {run.run_id!r} used the {run.cli!r} CLI, which has no "
+            "resumable conversation: it is one-shot and keeps no session on "
+            "disk. Launch a new subagent with the follow-up folded into the "
+            "prompt instead."
+        )
     if not run.session_id or run.session_id_status == "capture_failed":
         raise ToolError(
             f"Run {run.run_id!r} is not resumable: session_id is "
@@ -1434,6 +2161,10 @@ def resume_subagent(
         f"export SUBAGENT_RESULT_FILE={shlex.quote(str(result_path))}\n"
         f"export SUBAGENT_RUN_ID={shlex.quote(run.run_id)}\n"
         f"export SUBAGENT_STATUS_FILE={shlex.quote(str(status_path))}\n"
+        f"# A resume reuses the run dir, so the previous turn's STATUS.json is\n"
+        f"# sitting right here. _state_for reads its presence as 'the CLI has\n"
+        f"# exited', which would make this turn look finished before it began.\n"
+        f"rm -f {shlex.quote(str(status_path))}\n"
         f"cd {shlex.quote(str(run.cwd))} || exit 1\n"
         f"git_sha_before=$(git rev-parse HEAD 2>/dev/null || echo \"\")\n"
         f"started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
@@ -1548,6 +2279,8 @@ def resume_subagent(
             "current_command": current_command or "",
             "initial_output": _tail(raw_output, 20),
             "output_log": output_log,
+            "output_log_note": "raw ANSI pane dump, not line-oriented text —"
+            " read it with check_subagent, not a file tool",
             **watch_info,
         }
     )

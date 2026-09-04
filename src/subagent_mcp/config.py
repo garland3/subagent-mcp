@@ -30,7 +30,7 @@ class ServerConfig:
     tmux_socket: str | None = None
 
     # Which CLIs the server is willing to invoke.
-    cli_allowlist: tuple[str, ...] = ("claude", "opencode")
+    cli_allowlist: tuple[str, ...] = ("claude", "opencode", "atlas-chat")
 
     # Output limits.
     max_output_chars: int = 200_000

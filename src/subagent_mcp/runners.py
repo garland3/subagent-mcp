@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 
-from .cli_paths import augmented_path
+from .cli_paths import augmented_path, cli_extra_dirs
 
 
 class RunnerError(Exception):
@@ -13,18 +14,36 @@ class RunnerError(Exception):
 _POINTER = "Read the file at {path} and execute all instructions in it."
 
 # Standing instruction appended to every launch prompt (Phase 1.1). Tells the
-# agent to write a short RESULT.md before finishing. The actual file path is
+# agent to write a short result summary before finishing. The actual file path is
 # inlined so the model sees it directly, and $SUBAGENT_RESULT_FILE is exported
 # in run.sh so shell commands can reference it too.
+#
+# The instruction leads with the absolute path and states the negative
+# explicitly. An earlier wording opened with "write a short RESULT.md to
+# <path>", which invites the model to pattern-match on the bare filename and
+# create ./RESULT.md in the working directory instead -- i.e. inside the repo,
+# where `git add -A` sweeps it into a commit and (worst case) an upstream PR.
+# The run directory is outside every repo, so a correctly-followed instruction
+# cannot collide between concurrent agents or dirty a working tree.
+# `_reconcile_stray_result` in server.py recovers the case where it is ignored.
 _RESULT_INSTRUCTION = """
 
 ---
 [subagent-mcp standing instruction]
-Before finishing, write a short RESULT.md to {result_path} summarizing:
+Before finishing, write a short summary of your work to this exact absolute path:
+
+    {result_path}
+
+Write it there and nowhere else. Do NOT create a RESULT.md in the repository or
+in your working directory -- that path is outside any repo precisely so your
+summary never lands in a commit. The same path is in $SUBAGENT_RESULT_FILE.
+
+Cover:
 - What you did
 - What you verified (commands run, outputs checked)
 - What you could not do or left incomplete
 - Open questions for the operator
+
 This file is how the operator reads your work without opening tmux."""
 
 # Sentinel used while building argv so that wrapper_command can render the
@@ -36,7 +55,18 @@ _PROMPT_SENTINEL = object()
 class CLIRunner:
     """Builds the command string and wrapper script for a supported CLI."""
 
-    _CLIs = ("claude", "opencode")
+    # atlas-chat is ATLAS's own non-interactive chat CLI (atlas-ui-3's
+    # ``atlas-chat`` console script). Unlike claude/opencode it is one-shot:
+    # no TUI, no conversation id, no resume. It takes the prompt as a trailing
+    # positional argument.
+    _CLIs = ("claude", "opencode", "atlas-chat")
+
+    # CLIs with no notion of a persisted conversation id, so ``session_id``
+    # is meaningless for them and resume_subagent cannot work.
+    _NO_SESSION_CLIs = ("atlas-chat",)
+
+    # CLIs with no per-run agent/persona selector.
+    _NO_AGENT_CLIs = ("atlas-chat",)
 
     def __init__(
         self,
@@ -56,6 +86,12 @@ class CLIRunner:
             raise RunnerError(f"Unsupported cli {cli!r}; choose from {self._CLIs}")
         if prompt_mode not in ("inline", "pointer"):
             raise RunnerError("prompt_mode must be 'inline' or 'pointer'")
+        if agent and cli in self._NO_AGENT_CLIs:
+            raise RunnerError(f"{cli} has no --agent equivalent; drop the agent argument")
+        if session_id and cli in self._NO_SESSION_CLIs:
+            raise RunnerError(
+                f"{cli} has no conversation id to pre-assign; leave session_id unset"
+            )
         self.cli = cli
         # argv[0]: an absolute path when the caller resolved one, so the pane
         # does not depend on tmux having inherited a usable PATH.
@@ -128,6 +164,28 @@ class CLIRunner:
             argv.extend((arg, False) for arg in self.extra_args)
             argv.append(("--prompt", False))
             argv.append((_PROMPT_SENTINEL, True))
+        elif self.cli == "atlas-chat":
+            # atlas-chat has no permission prompts to skip -- it is
+            # non-interactive by construction. ``dangerous`` maps to the
+            # nearest analogue: --agent-mode, which lets the model decide when
+            # to call tools rather than answering from the prompt alone. A
+            # subagent that cannot act is not much of a subagent.
+            #
+            # --agent-mode and --only-rag are argparse-mutually-exclusive, so
+            # an explicit choice in extra_args wins over the default.
+            if self.dangerous and not (
+                {"--agent-mode", "--only-rag"} & set(self.extra_args)
+            ):
+                argv.append(("--agent-mode", False))
+            if self.model:
+                argv.extend([("--model", False), (self.model, False)])
+            argv.extend((arg, False) for arg in self.extra_args)
+            # The prompt is a trailing positional, not a flag value -- so a
+            # prompt that happens to begin with "-" ("--json is confusing me",
+            # "-o means what here?") is otherwise argv the parser tries to
+            # interpret. "--" ends option parsing and makes the rest literal.
+            argv.append(("--", False))
+            argv.append((_PROMPT_SENTINEL, True))
         return argv
 
     def _render(self, token: str | object, is_prompt: bool) -> str:
@@ -152,6 +210,29 @@ class CLIRunner:
             self._render(token, is_prompt) for token, is_prompt in self._arg_tuples()
         )
 
+    def _cli_env_exports(self) -> str:
+        """Per-CLI environment the wrapper needs, or "" for CLIs that need none.
+
+        atlas-chat writes to ATLAS's DuckDB chat history, which defaults to
+        ``duckdb:///data/chat_history.db`` relative to the cwd -- i.e. the very
+        file the long-running atlas-server process holds an exclusive lock on.
+        DuckDB is single-writer, so a subagent launched while ATLAS is up dies
+        with "Could not set lock on file ... Conflicting lock is held".
+
+        Giving each run its own database sidesteps the lock entirely and keeps
+        one subagent's history out of another's. An operator who deliberately
+        wants the shared database can export CHAT_HISTORY_DB_URL themselves;
+        the ``:-`` default only fills in when it is unset.
+        """
+        if self.cli != "atlas-chat":
+            return ""
+        db_path = self.run_dir / "chat_history.db"
+        return (
+            "# atlas-chat: give this run its own DuckDB so it does not contend\n"
+            "# with the lock atlas-server holds on the shared chat history.\n"
+            f"export CHAT_HISTORY_DB_URL=\"${{CHAT_HISTORY_DB_URL:-duckdb:///{db_path}}}\"\n"
+        )
+
     def write_wrapper(self, run_id: str, cwd: Path) -> Path:
         """Write an executable run.sh into run_dir and return its path.
 
@@ -167,14 +248,25 @@ class CLIRunner:
         result_path = self._result_path
         # The CLI itself is invoked by absolute path, but it spawns helpers
         # (node, bun, ripgrep, git hooks) that need the same widened PATH.
+        # Per-CLI install roots (e.g. the ATLAS venv for atlas-chat) belong in
+        # the pane's PATH too, not just in argv[0] — the CLI's own subprocesses
+        # look up siblings there.
+        pane_path = os.pathsep.join([augmented_path(), *cli_extra_dirs(self.cli)])
         text = (
             f"#!/usr/bin/env bash\n"
             f"# generated by subagent-mcp — {run_id}\n"
-            f"export PATH={shlex.quote(augmented_path())}\n"
+            f"export PATH={shlex.quote(pane_path)}\n"
             f"# Phase 1.1: the agent writes its summary here before finishing.\n"
             f"export SUBAGENT_RESULT_FILE={shlex.quote(str(result_path))}\n"
             f"export SUBAGENT_RUN_ID={shlex.quote(run_id)}\n"
             f"export SUBAGENT_STATUS_FILE={shlex.quote(str(status_path))}\n"
+            f"{self._cli_env_exports()}"
+            f"# STATUS.json means 'the CLI tracked by this run dir has exited'.\n"
+            f"# A resume reuses the run dir, so a stale one from the previous\n"
+            f"# turn would otherwise sit here claiming this turn is finished --\n"
+            f"# and _state_for reads its presence as completion. Clear it first\n"
+            f"# so the file only ever describes the run now starting.\n"
+            f"rm -f {shlex.quote(str(status_path))}\n"
             f"cd {shlex.quote(str(cwd))} || exit 1\n"
             f"# Phase 1.3: capture git state before the agent runs.\n"
             f"git_sha_before=$(git rev-parse HEAD 2>/dev/null || echo \"\")\n"
@@ -253,3 +345,25 @@ def build_runner(
         executable=executable,
         session_id=session_id,
     )
+
+
+def validate_cli_args(
+    cli: str,
+    *,
+    agent: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Reject arguments a CLI cannot express, before anything is created.
+
+    ``CLIRunner.__init__`` enforces the same rules, but by then the caller has
+    already made a run directory, written meta.json, and registered the run --
+    so raising there leaves a phantom dead run behind for listing and
+    retention tools to trip over. Callers validate up front with this; the
+    constructor keeps its own check as the backstop for direct construction.
+    """
+    if agent and cli in CLIRunner._NO_AGENT_CLIs:
+        raise RunnerError(f"{cli} has no --agent equivalent; drop the agent argument")
+    if session_id and cli in CLIRunner._NO_SESSION_CLIs:
+        raise RunnerError(
+            f"{cli} has no conversation id to pre-assign; leave session_id unset"
+        )
