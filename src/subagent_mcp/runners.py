@@ -180,7 +180,11 @@ class CLIRunner:
             if self.model:
                 argv.extend([("--model", False), (self.model, False)])
             argv.extend((arg, False) for arg in self.extra_args)
-            # The prompt is a trailing positional, not a flag value.
+            # The prompt is a trailing positional, not a flag value -- so a
+            # prompt that happens to begin with "-" ("--json is confusing me",
+            # "-o means what here?") is otherwise argv the parser tries to
+            # interpret. "--" ends option parsing and makes the rest literal.
+            argv.append(("--", False))
             argv.append((_PROMPT_SENTINEL, True))
         return argv
 

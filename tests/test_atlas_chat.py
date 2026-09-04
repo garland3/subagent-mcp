@@ -42,7 +42,9 @@ def test_atlas_chat_inline_argv(tmp_path):
     assert "--agent-mode" in argv
     assert argv[argv.index("--model") + 1] == "gpt-4o"
     assert "--json" in argv
-    # The prompt is a trailing positional, not the value of a flag.
+    # The prompt is a trailing positional, not the value of a flag, guarded by
+    # "--" so a prompt beginning with "-" is not parsed as an option.
+    assert argv[-2] == "--"
     assert argv[-1].startswith("$(cat")
 
 
@@ -58,6 +60,7 @@ def test_atlas_chat_pointer_argv(tmp_path):
     )
     argv = runner.argv()
     assert "--agent-mode" not in argv
+    assert argv[-2] == "--"
     assert "Read the file" in argv[-1]
     assert "$(cat" not in argv[-1]
 
@@ -224,3 +227,18 @@ def test_allowlist_can_exclude_atlas_chat(env):
             launch_subagent(prompt="p", cwd=str(env["tmp"]), cli="atlas-chat")
     finally:
         set_config(cfg)
+
+
+def test_dash_leading_prompt_survives_option_parsing(tmp_path):
+    """A prompt starting with "-" must reach atlas-chat as text, not as flags."""
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    argv = build_runner(
+        "atlas-chat",
+        prompt="--json please explain",
+        prompt_mode="pointer",
+        run_dir=run_dir,
+    ).argv()
+    # Everything after "--" is positional, so the prompt cannot be mistaken
+    # for an option however it starts.
+    assert argv.index("--") == len(argv) - 2

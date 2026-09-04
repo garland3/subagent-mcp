@@ -157,7 +157,7 @@ animal and the differences are worth knowing before you launch one:
 
 | | `claude` / `opencode` | `atlas-chat` |
 | --- | --- | --- |
-| Prompt | flag value (`--prompt`) or positional | trailing positional |
+| Prompt | flag value (`--prompt`) or positional | trailing positional, after `--` |
 | Session | resumable conversation id | none — one-shot, answers and exits |
 | `agent` | `--agent <name>` | rejected; no equivalent flag |
 | `dangerous` | skip permission prompts | `--agent-mode` (let the model call tools) |
