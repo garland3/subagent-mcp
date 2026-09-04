@@ -33,6 +33,28 @@ _EXTRA_DIR_PATTERNS = (
 )
 
 
+# Per-CLI install roots that are not on anyone's PATH. atlas-chat is a console
+# script inside the ATLAS virtualenv, never installed globally, so resolving it
+# means knowing where that venv lives. SUBAGENT_CLI_ATLAS_CHAT overrides this
+# for a checkout in a different place.
+_CLI_EXTRA_DIR_PATTERNS: dict[str, tuple[str, ...]] = {
+    "atlas-chat": (
+        "~/ATLAS-GROUP/atlas-ui-3/.venv/bin",
+        "~/git/atlas/atlas-ui-3/.venv/bin",
+    ),
+}
+
+
+def cli_extra_dirs(cli: str) -> list[str]:
+    """Existing per-CLI install roots for ``cli``, in search order."""
+    out: list[str] = []
+    for pattern in _CLI_EXTRA_DIR_PATTERNS.get(cli, ()):
+        path = Path(pattern).expanduser()
+        if path.is_dir():
+            out.append(str(path))
+    return out
+
+
 def _version_key(name: str) -> tuple[int, ...]:
     """Numeric sort key for a ``vMAJOR.MINOR.PATCH`` directory name."""
     parts = name.lstrip("v").split(".")
@@ -103,9 +125,14 @@ def resolve_cli(cli: str) -> str | None:
     override = _env_override(cli)
     if override:
         return override
-    return shutil.which(cli, path=augmented_path())
+    # Per-CLI roots go last: a copy already on PATH still wins.
+    search = os.pathsep.join([augmented_path(), *cli_extra_dirs(cli)])
+    return shutil.which(cli, path=search)
 
 
-def searched_dirs() -> list[str]:
+def searched_dirs(cli: str | None = None) -> list[str]:
     """Every directory ``resolve_cli`` looks in — for error messages."""
-    return [p for p in augmented_path().split(os.pathsep) if p]
+    dirs = [p for p in augmented_path().split(os.pathsep) if p]
+    if cli:
+        dirs.extend(d for d in cli_extra_dirs(cli) if d not in dirs)
+    return dirs

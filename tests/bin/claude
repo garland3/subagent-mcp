@@ -7,7 +7,10 @@ have time to inspect the tmux pane.
 
 import json
 import os
+import signal
 import sys
+import termios
+import tty
 import time
 
 
@@ -42,6 +45,26 @@ def main() -> None:
             fh.write(json.dumps(out, ensure_ascii=False) + "\n")
     else:
         print(json.dumps(out, ensure_ascii=False))
+
+    # A prompt of "exit-now" reproduces the normal end state: the CLI
+    # returns while run.sh goes on to exec an interactive shell, so the
+    # pane outlives the agent.
+    if prompt and prompt.strip().startswith("exit-now"):
+        return
+
+    # Some tests need a CLI that shrugs off Ctrl-C the way a real TUI does, so
+    # stop_subagent's escalation ladder has something to escalate against.
+    # Raw mode is how claude/opencode really do it: the terminal stops turning
+    # ^C into SIGINT and hands it over as a plain 0x03 byte the app decides
+    # what to do with, which is why one Ctrl-C does not end them.
+    # A marker file, not an env var: tmux panes inherit the tmux *server's*
+    # environment, which the test process cannot amend after the server is up.
+    if os.path.exists(os.path.join(os.getcwd(), ".ignore-sigint")):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            tty.setraw(sys.stdin.fileno())
+        except (termios.error, ValueError, OSError):
+            pass
 
     # Sleep until killed or a very long timeout.
     time.sleep(120)

@@ -46,6 +46,9 @@ class Run:
     #   "captured"       — we found the id post-launch (opencode)
     #   "capture_failed" — opencode capture failed; the run is NOT resumable
     #                      through us and the failure is visible in this field
+    #   "unsupported"    — the CLI has no conversation id at all (atlas-chat is
+    #                      one-shot). Distinct from capture_failed: nothing was
+    #                      lost, there was never anything to capture.
     #   ""               — not attempted (e.g. dry run, or old record)
     session_id_status: str = ""
     model: str | None = None
@@ -127,27 +130,59 @@ def _window_name(task: str | None, prompt: str) -> str:
     return slug or "subagent"
 
 
+def is_sweepable(run_dir: Path, runs_root: Path) -> bool:
+    """True when ``run_dir`` is a run directory ``delete_run_dirs`` will remove.
+
+    ``discover_runs`` finds ``meta.json`` at any depth, but ``delete_run_dirs``
+    only ever removes a directory sitting *directly* under ``runs_root`` (that
+    guard is deliberate — it is what stops a stray meta.json from turning the
+    sweep into an arbitrary rmtree). A record found deeper is therefore
+    discoverable but not reapable, which is a state the tools have to be able
+    to name rather than silently mishandle.
+    """
+    try:
+        return run_dir.resolve().parent == runs_root.resolve()
+    except OSError:
+        return False
+
+
 def discover_runs(runs_root: Path) -> dict[str, Run]:
-    """Load all valid meta.json files under runs_root."""
+    """Load all valid meta.json files under runs_root.
+
+    On a ``run_id`` collision — the same id present at two depths — the
+    sweepable top-level copy wins. Without that rule the deeper copy shadowed
+    the real record, so a sweep could delete the top-level directory and the
+    very next listing would resurrect the run from the nested one, reporting a
+    different ``pane_id`` for the same id.
+    """
     registry: dict[str, Run] = {}
-    if not runs_root.exists():
-        return registry
-    for meta_path in runs_root.rglob("meta.json"):
+    for meta_path in sorted(runs_root.rglob("meta.json")) if runs_root.exists() else []:
         try:
             data = json.loads(meta_path.read_text(encoding="utf-8"))
             run = Run.from_meta(data)
         except Exception:
             continue
         run.run_dir = meta_path.parent
+        existing = registry.get(run.run_id)
+        if existing is not None and is_sweepable(existing.run_dir, runs_root):
+            # Already holding the canonical top-level copy; keep it.
+            continue
         registry[run.run_id] = run
     return registry
 
 
 def registry(runs_root: Path, refresh: bool = False) -> dict[str, Run]:
+    """Return the run registry.
+
+    The result is a **copy**. Callers hold it across mutating operations
+    (``delete_run_dirs`` pops from the cache), and handing out the live dict
+    made those callers' own arithmetic wrong — ``sweep_stale_subagents``
+    subtracted its deletions twice and could report a negative remainder.
+    """
     global _REGISTRY
     if refresh or not _REGISTRY:
         _REGISTRY = discover_runs(runs_root)
-    return _REGISTRY
+    return dict(_REGISTRY)
 
 
 def make_run_id(slug: str) -> str:
@@ -527,4 +562,8 @@ def derive_state(
     if run.cli == "opencode":
         root = opencode_state_root or (Path.home() / ".local" / "share" / "opencode")
         return _opencode_state(run, root)
+    # atlas-chat (and any future one-shot CLI) keeps no transcript to read:
+    # it answers once and exits. "" means "unknown", and the caller falls back
+    # to pane liveness plus the wrapper's STATUS.json exit code — which is the
+    # whole truth for a process that either finished or did not.
     return "", ""

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Fake atlas-chat CLI for subagent-mcp tests.
+
+Mirrors the real console script's shape: flags first, prompt as a trailing
+positional, no session id, and a one-shot exit rather than a long-lived TUI.
+Also records CHAT_HISTORY_DB_URL so tests can assert the wrapper isolates each
+run's DuckDB from the one atlas-server holds a lock on.
+"""
+
+import json
+import os
+import sys
+import time
+
+_VALUE_FLAGS = ("--model", "--tools", "-o", "--output", "--user-email", "--data-sources")
+
+
+def main() -> None:
+    log_path = os.environ.get("SUBAGENT_TEST_LOG")
+
+    prompt: str | None = None
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in _VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        prompt = arg
+        i += 1
+
+    out = {
+        "cli": "atlas-chat",
+        "argv": sys.argv[1:],
+        "prompt": prompt,
+        "chat_history_db_url": os.environ.get("CHAT_HISTORY_DB_URL"),
+    }
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(out, ensure_ascii=False) + "\n")
+    else:
+        print(json.dumps(out, ensure_ascii=False))
+
+    # atlas-chat is one-shot: it answers and exits. Tests that need the pane to
+    # stay busy pass "stay-open" so there is something alive to inspect.
+    if prompt and prompt.strip().startswith("stay-open"):
+        time.sleep(120)
+
+
+if __name__ == "__main__":
+    main()

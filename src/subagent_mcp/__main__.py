@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--cli-allowlist",
         type=str,
-        default=os.environ.get("SUBAGENT_CLI_ALLOWLIST", "claude,opencode"),
+        default=os.environ.get("SUBAGENT_CLI_ALLOWLIST", "claude,opencode,atlas-chat"),
         help="Comma-separated CLIs the server is allowed to invoke",
     )
     parser.add_argument(
